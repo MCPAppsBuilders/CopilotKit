@@ -3,6 +3,12 @@ import type { Component } from "vue";
 import type { ActivityMessage } from "@ag-ui/core";
 import type { AbstractAgent } from "@ag-ui/client";
 import { DEFAULT_AGENT_ID } from "@copilotkit/shared";
+// Bridge-free entry: keeps the MCP Apps host (and the ext-apps bundle it pulls)
+// out of an app that renders no MCP activity.
+import {
+  MCPAppsActivityType as MCP_APPS_ACTIVITY_TYPE,
+  ɵhandlesInvalidMCPAppsContent,
+} from "@copilotkit/mcp-apps-renderer/activity";
 import { useCopilotKit } from "../providers/useCopilotKit";
 import { useCopilotChatConfiguration } from "../providers/useCopilotChatConfiguration";
 import type {
@@ -69,7 +75,21 @@ export function useRenderActivityMessage() {
           `'${message.activityType}':`,
         parseResult.error,
       );
-      return null;
+      // An MCP Apps activity is still handed to its renderer, which owns the
+      // failure lifecycle and re-validates for itself. Returning null here
+      // would drop it for good: the widget would never mount, so nothing
+      // could ever decide whether the content is merely mid-stream, remove
+      // the widget, or tell the user why it is missing.
+      // Only a renderer that declares it owns the failure lifecycle gets the
+      // unparsed content. Checking the mark rather than the content schema
+      // matters: the MCP Apps schema is public, so a custom renderer may reuse
+      // it while still expecting parsed content.
+      if (
+        message.activityType !== MCP_APPS_ACTIVITY_TYPE ||
+        !ɵhandlesInvalidMCPAppsContent(renderer.render)
+      ) {
+        return null;
+      }
     }
 
     const agent: AbstractAgent | undefined = copilotkit.value.getAgent(
@@ -82,7 +102,7 @@ export function useRenderActivityMessage() {
       >,
       props: {
         activityType: message.activityType,
-        content: parseResult.data,
+        content: parseResult.success ? parseResult.data : message.content,
         message,
         agent,
       },

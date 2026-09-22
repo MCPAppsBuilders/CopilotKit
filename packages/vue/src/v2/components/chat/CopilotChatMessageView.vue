@@ -21,6 +21,10 @@ import type {
 } from "../../types";
 import { useCopilotKit } from "../../providers/useCopilotKit";
 import { useCopilotChatConfiguration } from "../../providers/useCopilotChatConfiguration";
+import {
+  MCPAppsActivityType as MCP_APPS_ACTIVITY_TYPE,
+  ɵhandlesInvalidMCPAppsContent,
+} from "@copilotkit/mcp-apps-renderer/activity";
 import CopilotChatAssistantMessage from "./CopilotChatAssistantMessage.vue";
 import CopilotChatReasoningMessage from "./CopilotChatReasoningMessage.vue";
 import CopilotChatUserMessage from "./CopilotChatUserMessage.vue";
@@ -339,13 +343,29 @@ function resolveActivityRenderer(
 
   if (!renderer) return null;
   const parsed = renderer.content.safeParse(message.content);
-  if (!parsed.success) return null;
+  if (!parsed.success) {
+    // An MCP Apps activity is still handed to its renderer, which owns the
+    // failure lifecycle and re-validates for itself. Returning null here
+    // would drop it for good: the widget would never mount, so nothing
+    // could ever decide whether the content is merely mid-stream, remove
+    // the widget, or tell the user why it is missing.
+    // Only a renderer that declares it owns the failure lifecycle gets the
+    // unparsed content. Checking the mark rather than the content schema
+    // matters: the MCP Apps schema is public, so a custom renderer may reuse
+    // it while still expecting parsed content.
+    if (
+      message.activityType !== MCP_APPS_ACTIVITY_TYPE ||
+      !ɵhandlesInvalidMCPAppsContent(renderer.render)
+    ) {
+      return null;
+    }
+  }
 
   return {
     renderer: renderer.render as Component,
     props: {
       activityType: message.activityType,
-      content: parsed.data,
+      content: parsed.success ? parsed.data : message.content,
       message,
       agent: resolvedThreadAgent.value,
     },

@@ -8,6 +8,7 @@ import type {
   Message,
   UserMessage,
 } from "@ag-ui/core";
+import { MCPAppsActivityContentSchema } from "@copilotkit/mcp-apps-renderer/activity";
 import CopilotKitProvider from "../../../providers/CopilotKitProvider.vue";
 import CopilotChatConfigurationProvider from "../../../providers/CopilotChatConfigurationProvider.vue";
 import CopilotChatMessageView from "../CopilotChatMessageView.vue";
@@ -110,6 +111,86 @@ describe("CopilotChatMessageView activity rendering", () => {
     });
 
     expect(screen.queryByTestId("activity-renderer")).toBeNull();
+  });
+});
+
+// The chat view is the second Vue dispatch entry point (the first is the public
+// `useRenderActivityMessage` hook). Both must grant the MCP Apps renderer, and
+// only it, content the schema rejected: dropping it here would mean the widget
+// never mounts, so nothing could decide whether the content is mid-stream,
+// retire the widget, or explain its absence.
+describe("CopilotChatMessageView invalid MCP Apps content", () => {
+  const agentId = "default";
+  const threadId = "thread-test";
+
+  // Fails the schema: `serverHash` is required.
+  const invalidMcpActivity = {
+    id: "act-mcp",
+    role: "activity",
+    activityType: "mcp-apps",
+    content: { resourceUri: "ui://server/app" },
+  } as ActivityMessage;
+
+  function renderMessageView({
+    messages,
+    renderActivityMessages,
+  }: {
+    messages: Message[];
+    renderActivityMessages?: unknown[];
+  }) {
+    const Host = defineComponent({
+      components: {
+        CopilotKitProvider,
+        CopilotChatConfigurationProvider,
+        CopilotChatMessageView,
+      },
+      setup() {
+        return { messages, agentId, threadId, renderActivityMessages };
+      },
+      template: `
+        <CopilotKitProvider runtime-url="/api/copilotkit" :render-activity-messages="renderActivityMessages">
+          <CopilotChatConfigurationProvider :agent-id="agentId" :thread-id="threadId">
+            <CopilotChatMessageView :messages="messages" />
+          </CopilotChatConfigurationProvider>
+        </CopilotKitProvider>
+      `,
+    });
+
+    return render(Host);
+  }
+
+  it("hands the built-in renderer content the schema rejected", async () => {
+    renderMessageView({ messages: [invalidMcpActivity] });
+
+    // The built-in renderer mounted with the raw content: with no agent
+    // registered it reports that, which is a renderer on screen, not a
+    // dropped message.
+    expect(
+      await screen.findByText(/No agent available to fetch resource/),
+    ).toBeDefined();
+  });
+
+  it("skips a custom renderer that merely reuses the public MCP Apps schema", () => {
+    const CustomMcpRenderer = defineComponent({
+      name: "CustomMcpRenderer",
+      template: `<div data-testid="custom-mcp-renderer">custom</div>`,
+    });
+    renderMessageView({
+      messages: [invalidMcpActivity],
+      renderActivityMessages: [
+        {
+          activityType: "mcp-apps",
+          content: MCPAppsActivityContentSchema,
+          render: CustomMcpRenderer,
+        },
+      ],
+    });
+
+    // Registering the public schema must not buy the failure-lifecycle
+    // exception: this renderer expects parsed content and would break on the
+    // raw value.
+    expect(screen.queryByTestId("custom-mcp-renderer")).toBeNull();
+    expect(screen.queryByText(/No agent available/)).toBeNull();
   });
 });
 

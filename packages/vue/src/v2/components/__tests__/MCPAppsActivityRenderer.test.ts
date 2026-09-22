@@ -14,6 +14,10 @@ vi.mock("../../providers/useCopilotKit", () => ({
     copilotkit: {
       value: {
         runAgent: runCopilotAgent,
+        // The failure lifecycle asks the core how final an activity is and
+        // listens for runs settling; neither is under test here.
+        getActivityExchangeState: () => "unknown",
+        subscribe: () => ({ unsubscribe() {} }),
       },
     },
   }),

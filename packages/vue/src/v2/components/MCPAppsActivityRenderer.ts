@@ -26,6 +26,10 @@ export type {
   ɵMcpFollowUpHost,
 } from "@copilotkit/mcp-apps-renderer/activity";
 
+import {
+  ɵmarkHandlesInvalidMCPAppsContent,
+  ɵmcpAppsIdentityKey,
+} from "@copilotkit/mcp-apps-renderer/activity";
 import type { MCPAppsActivityContent } from "@copilotkit/mcp-apps-renderer/activity";
 // Type-only imports: erased at build, so they never pull the ext-apps bridge
 // into the bundle. Only the dynamic import() below does, and only lazily.
@@ -73,6 +77,13 @@ export const MCPAppsActivityRenderer = defineComponent({
     // store or from props. Cleared as soon as valid content resumes, unlike
     // `error`, which is a fatal setup failure.
     const contentError = ref<Error | null>(null);
+    // Terminal removal, decided by the shared controller, recorded against the
+    // identity of the exchange it was a verdict on. The same activity may later
+    // carry a different resource, and that new exchange may mount; a bare flag
+    // would keep the component blank for good.
+    const removedFor = ref<string | null>(null);
+    const identityKey = computed(() => ɵmcpAppsIdentityKey(props.content));
+    const removed = computed(() => removedFor.value === identityKey.value);
     const isLoading = ref(true);
     const iframeSize = ref<{ width?: number; height?: number }>({});
     // shallowRef for externally-owned objects: the session, the iframe element
@@ -116,6 +127,9 @@ export const MCPAppsActivityRenderer = defineComponent({
         }
 
         let mounted = true;
+        // The identity this bind is for. A removal reported later belongs to
+        // it, whatever the content prop says by then.
+        const boundKey = ɵmcpAppsIdentityKey(props.content);
         isLoading.value = true;
         error.value = null;
         contentError.value = null;
@@ -174,11 +188,37 @@ export const MCPAppsActivityRenderer = defineComponent({
               // activities. It still calls syncContent for activities rendered
               // from an external messages list (see the seed below).
               messageId: messageId.value,
+              // Answering "is this content still being produced" needs the
+              // core's run tracking, which mcp-apps-renderer deliberately
+              // cannot reach. Read fresh on every observation rather than
+              // captured, so a widget that mounts mid-run sees the run end.
+              getExchangeState: () => {
+                const currentAgent = props.agent;
+                const id = messageId.value;
+                if (!currentAgent?.agentId || !id) return "unknown";
+                return copilotkit.value.getActivityExchangeState(
+                  currentAgent.agentId,
+                  currentAgent.threadId || "default",
+                  id,
+                  currentAgent,
+                );
+              },
+              // A run ending with unchanged content leaves the controller on a
+              // provisional observation. This subscription re-reads the store
+              // so the controller sees the now-settled exchange state.
+              subscribeRunSettled: (callback) =>
+                copilotkit.value.subscribe({ onActivityRunSettled: callback }),
               hooks: {
                 onResource: (resource) => {
                   if (!mounted) return;
                   fetchedResource.value = resource;
                   isLoading.value = false;
+                },
+                // Terminal: the widget has nothing left to show. The adapter
+                // owns the element, so it is the only one that can take it off
+                // screen.
+                onRemoved: () => {
+                  if (mounted) removedFor.value = boundKey;
                 },
                 onSizeChanged: (size) => {
                   if (mounted) iframeSize.value = size;
@@ -259,8 +299,13 @@ export const MCPAppsActivityRenderer = defineComponent({
       };
     });
 
-    return () =>
-      h(
+    return () => {
+      // Terminal removal of THIS exchange: render nothing at all. The container
+      // going away unsets the template ref, which the bind watcher tracks, so
+      // the session is torn down with it. A new identity renders the container
+      // again and the watcher binds afresh.
+      if (removed.value) return null;
+      return h(
         "div",
         {
           ref: containerRef,
@@ -293,7 +338,12 @@ export const MCPAppsActivityRenderer = defineComponent({
             : null,
         ],
       );
+    };
   },
 });
+
+// This renderer owns the MCP Apps failure lifecycle, so the dispatcher must
+// hand it content the schema rejected instead of dropping the message.
+ɵmarkHandlesInvalidMCPAppsContent(MCPAppsActivityRenderer);
 
 export default MCPAppsActivityRenderer;

@@ -406,3 +406,90 @@ describe("MCP Apps ui/message followUp behavior", () => {
     expect(runSpy.mock.calls.length).toBeGreaterThan(before);
   });
 });
+
+// Vue-specific placement: React proves this in MCPAppsProxy.e2e.test.tsx, which
+// has no Vue counterpart yet. The proxy path is otherwise identical (shared
+// session), so the scenario lives next to the only Vue suite that drives a real
+// bridge from the iframe side.
+describe("MCP Apps tools/call failure lifecycle", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    document.body.innerHTML = "";
+  });
+
+  it("answers a failing tools/call before the widget is removed, then explains it once", async () => {
+    const agent = new MockMCPProxyAgent();
+    agent.agentId = "proxy-tools-failure";
+    const iframe = await setupMCPActivity(agent, "Tools failure test");
+
+    // Record, for every message posted to the widget, whether its iframe was
+    // still on screen at that moment. The response must go out while it is;
+    // removal may only follow.
+    const posted: Array<{ message: Record<string, any>; attached: boolean }> =
+      [];
+    const cw = iframe.contentWindow!;
+    const origPostMessage = cw.postMessage.bind(cw);
+    cw.postMessage = ((message: unknown, ...args: unknown[]) => {
+      posted.push({
+        message: message as Record<string, any>,
+        attached: document.body.contains(iframe),
+      });
+      return (origPostMessage as (...a: unknown[]) => void)(message, ...args);
+    }) as typeof cw.postMessage;
+
+    const originalRunAgent = agent.runAgent.bind(agent);
+    agent.runAgent = async (
+      input?: Partial<RunAgentInput>,
+    ): Promise<RunAgentResult> => {
+      const proxiedRequest = input?.forwardedProps?.__proxiedMCPRequest as
+        | { method: string }
+        | undefined;
+      if (proxiedRequest?.method === "tools/call") {
+        return {
+          result: {
+            content: [{ type: "text", text: "Payment declined." }],
+            isError: true,
+          },
+          newMessages: [],
+        };
+      }
+      return originalRunAgent(input);
+    };
+
+    const reqId = testId("req");
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: {
+          jsonrpc: "2.0",
+          id: reqId,
+          method: "tools/call",
+          params: { name: "pay", arguments: {} },
+        },
+        source: iframe.contentWindow,
+        origin: "",
+      }),
+    );
+    await waitFor(() => {
+      expect(posted.some((p) => p.message?.id === reqId)).toBe(true);
+    });
+
+    // The widget got the real error result, while it was still mounted.
+    const response = posted.find((p) => p.message?.id === reqId)!;
+    expect(response.message.result).toMatchObject({ isError: true });
+    expect(response.attached).toBe(true);
+
+    // Then, and only then, the widget goes and the agent is told once.
+    await waitFor(() => {
+      expect(document.body.contains(iframe)).toBe(false);
+    });
+    await waitFor(() => {
+      expect(
+        agent.addMessageCalls.filter((m) => m.role === "developer"),
+      ).toHaveLength(1);
+    });
+  });
+});
