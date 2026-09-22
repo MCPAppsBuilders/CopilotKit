@@ -66,6 +66,10 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
     // store or from props. Cleared as soon as valid content resumes, unlike
     // `error`, which is a fatal setup failure.
     const [contentError, setContentError] = useState<Error | null>(null);
+    // Terminal removal, decided by the shared controller. Separate from
+    // `error`: that one leaves a message on screen until a re-bind, this one
+    // means there is nothing left to show at all.
+    const [removed, setRemoved] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
     const [iframeSize, setIframeSize] = useState<{
       width?: number;
@@ -146,11 +150,31 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
             // activities. It still calls syncContent for activities rendered
             // from an external messages list (see the seed below).
             messageId,
+            // Answering "is this content still being produced" needs the core's
+            // run tracking, which mcp-apps-renderer deliberately cannot reach.
+            // Read fresh on every observation rather than captured, so a widget
+            // that mounts mid-run sees the run end.
+            getExchangeState: () => {
+              const currentAgent = agentRef.current;
+              if (!currentAgent?.agentId || !messageId) return "unknown";
+              return copilotkit.getActivityExchangeState(
+                currentAgent.agentId,
+                currentAgent.threadId || "default",
+                messageId,
+                currentAgent,
+              );
+            },
             hooks: {
               onResource: (resource) => {
                 if (!mounted) return;
                 setFetchedResource(resource);
                 setIsLoading(false);
+              },
+              // Terminal: the widget has nothing left to show. The adapter owns
+              // the element, so it is the only one that can take it off screen.
+              onRemoved: () => {
+                if (!mounted) return;
+                setRemoved(true);
               },
               onSizeChanged: (size) => {
                 if (mounted) setIframeSize(size);
@@ -236,6 +260,13 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
             border: "1px solid #e0e0e0",
           }
         : {};
+
+    // Terminal removal: render nothing at all. The container going away takes
+    // the iframe the effect mounted inside it with it, which is what keeps a
+    // disconnected frame from being left on screen.
+    if (removed) {
+      return null;
+    }
 
     return (
       <div

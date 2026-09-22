@@ -21,6 +21,28 @@ import {
 } from "./constants";
 import { MCPAppsActivityContentSchema } from "./content-schema";
 import type { MCPAppsActivityContent } from "./content-schema";
+import { classifyProxyResult } from "./classify-content";
+import { reasonFromToolError } from "./failure-reason";
+import type { McpFailureReason } from "./failure-reason";
+import { getWidgetController } from "./widget-controller";
+import type { McpExchangeState } from "./widget-controller";
+
+/**
+ * Whether content carries the identity a session needs to bind: without a
+ * resource and a server there is nothing to fetch, so there is nothing to
+ * mount yet either.
+ */
+const identityIsUsable = (content: unknown): boolean => {
+  const candidate = content as
+    | { resourceUri?: unknown; serverHash?: unknown }
+    | undefined;
+  return (
+    typeof candidate?.resourceUri === "string" &&
+    candidate.resourceUri.length > 0 &&
+    typeof candidate?.serverHash === "string" &&
+    candidate.serverHash.length > 0
+  );
+};
 
 /** Structural shape of an ag-ui activity message (avoids a hard type import). */
 interface ActivityLike {
@@ -178,6 +200,17 @@ export interface McpAppSessionHooks {
    * message rather than leave a stale error on screen.
    */
   onContentError?(err: Error | null): void;
+  /**
+   * TERMINAL: this widget has nothing left to show and must come off screen.
+   *
+   * Distinct from `onError`, which describes a session that failed to start and
+   * leaves the host showing an error until it re-binds. The session closes its
+   * own resources here, but it does not own the iframe: the adapter created and
+   * mounted that element, so only the adapter can remove it. An adapter that
+   * ignores this leaves a disconnected frame on screen, which is worse than the
+   * failure it replaces.
+   */
+  onRemoved?(reason: McpFailureReason): void;
 }
 
 export interface BindMcpAppOptions {
@@ -235,6 +268,22 @@ export interface BindMcpAppOptions {
   cancelFollowUpsOnTeardown?: boolean;
   /** Require the fetched resource URI to match exactly (Angular compatibility). */
   requireExactResourceUri?: boolean;
+  /**
+   * How final the adapter believes the current activity content is, read fresh
+   * on every observation.
+   *
+   * Supplied by the adapter because answering it needs `@copilotkit/core`
+   * (see `core.getActivityExchangeState`), which this package deliberately does
+   * not depend on. Omitted, the session treats activity content as `"unknown"`,
+   * which is the conservative reading: keep whatever is on screen, never remove
+   * it, never report it.
+   */
+  getExchangeState?: () => McpExchangeState;
+  /**
+   * A stable id for an activity that does not live in the agent's store, so its
+   * controller entry survives remounts. Ignored when `messageId` is set.
+   */
+  externalActivityKey?: string;
   /** Release already-started proxy/follow-up waits on teardown, without aborting the underlying run. */
   cancelRunningWaitOnTeardown?: boolean;
 }
@@ -412,6 +461,70 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
   let sandboxReady = false;
   let sandboxTimedOut = false;
 
+  // Failure lifecycle. The controller decides what the widget's state should be
+  // and whether the agent is told; this session only feeds it observations and
+  // carries out what it decides.
+  const boundAgent = getAgent();
+  const activityKey = messageId ?? opts.externalActivityKey;
+  const controller =
+    boundAgent && activityKey
+      ? getWidgetController({
+          agent: boundAgent,
+          threadId: boundAgent.threadId || "default",
+          activityKey,
+          isExternal: messageId === undefined,
+        })
+      : undefined;
+  const generation = controller?.rebind() ?? 0;
+  const capturedThreadId = boundAgent?.threadId || "default";
+
+  /**
+   * Remove this activity from the store, bound now to the agent observed at
+   * bind time rather than re-read later. Only a store-backed activity has
+   * anything to remove; an external one is not ours to edit.
+   */
+  const removeFromStore =
+    boundAgent && messageId
+      ? () => {
+          const current = boundAgent.messages as readonly ActivityLike[];
+          if (!current.some((m) => m?.id === messageId)) return;
+          boundAgent.setMessages(
+            (boundAgent.messages as ActivityLike[]).filter(
+              (m) => m?.id !== messageId,
+            ) as typeof boundAgent.messages,
+          );
+        }
+      : undefined;
+
+  /** Tell the adapter to take the widget off screen, then close our own side. */
+  const retireWidget = (reason: McpFailureReason) => {
+    controller?.finalizeRemoval(generation);
+    hooks?.onRemoved?.(reason);
+    closeSession();
+  };
+
+  /**
+   * Responses whose send this session is waiting on, keyed by JSON-RPC id.
+   *
+   * Cleanup belongs to the waiter, never to the send wrapper: a request
+   * cancelled before the SDK calls `send()` would otherwise leak, and an old
+   * send completing after a newer waiter registered under the same id would
+   * remove the newer one.
+   */
+  const pendingSends = new Map<
+    string | number,
+    { resolve(): void; reject(error: unknown): void }
+  >();
+
+  const isJsonRpcResponse = (
+    message: unknown,
+  ): message is { id: string | number } =>
+    !!message &&
+    typeof message === "object" &&
+    "id" in message &&
+    !("method" in message) &&
+    ("result" in message || "error" in message);
+
   /** Flush any buffered tool input/result to the widget once it is initialized. */
   const flushPending = () => {
     if (!ready || !bridge) return;
@@ -477,6 +590,38 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
     // store's, so both go through the same schema here. A rejection is
     // RECOVERABLE (reported through onContentError, cleared when valid content
     // returns), not a fatal session error.
+    // The controller decides whether this content is terminal. It runs before
+    // the recoverable-content path below, because a terminal verdict retires
+    // the widget rather than leaving an error on a widget that stays.
+    if (controller) {
+      const phase = controller.observe(generation, {
+        origin: "activity",
+        content,
+        exchange: opts.getExchangeState?.() ?? "unknown",
+        identityAvailable: identityIsUsable(content),
+      });
+      if (phase === "removed" || phase === "retiring") {
+        const reason = reasonFromToolError("activity");
+        if (controller.signal === "reserved") {
+          const agentNow = getAgent();
+          if ((agentNow?.threadId || "default") === capturedThreadId) {
+            void controller
+              .commitSignal(generation, host, removeFromStore)
+              .catch((error: unknown) => {
+                console.error(
+                  "[MCPAppsRenderer] activity failure report failed:",
+                  error,
+                );
+              });
+          } else {
+            controller.abandonSignal(generation);
+          }
+        }
+        retireWidget(reason);
+        return;
+      }
+    }
+
     const parsedContent = MCPAppsActivityContentSchema.safeParse(content);
     if (!parsedContent.success) {
       reportContentRejected(content, parsedContent.error);
@@ -789,7 +934,7 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
         return { isError: false };
       };
 
-      bridge.oncalltool = async (params) => {
+      bridge.oncalltool = async (params, extra) => {
         const { serverHash, serverId } = getContent();
         const currentAgent = getAgent();
         if (!serverHash) {
@@ -832,9 +977,93 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
           }
           throw err;
         }
-        return MCPAppsActivityContentSchema.shape.result.parse(
+
+        const parsed = MCPAppsActivityContentSchema.shape.result.safeParse(
           runResult.result ?? {},
         );
+        const verdict = classifyProxyResult(parsed);
+        if (parsed.success && verdict.kind === "keep") {
+          return parsed.data;
+        }
+
+        // The widget is going, but it is still owed an answer to THIS request.
+        // Everything that could tear it down waits until that answer is out.
+        controller?.observe(generation, {
+          origin: "proxy",
+          parsed,
+          exchange: "settled",
+          identityAvailable: true,
+        });
+
+        // A result that parsed is forwarded as it stands, errors included: the
+        // widget should see what the tool actually said. One that did not parse
+        // is replaced by a controlled error, because passing on a payload the
+        // host itself cannot read would tell the widget nothing useful.
+        const response: CallToolResult = parsed.success
+          ? parsed.data
+          : {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: "The tool result could not be read by the host.",
+                },
+              ],
+            };
+        const reason =
+          verdict.kind === "retire"
+            ? verdict.reason
+            : reasonFromToolError("proxy");
+
+        const requestId = extra?.requestId;
+        const sent =
+          requestId === undefined
+            ? Promise.resolve()
+            : new Promise<void>((resolve, reject) => {
+                pendingSends.set(requestId, { resolve, reject });
+              });
+
+        void (async () => {
+          const signal = extra?.signal;
+          const aborted = new Promise<never>((_, reject) => {
+            if (signal?.aborted) {
+              reject(new Error("proxy request aborted"));
+              return;
+            }
+            signal?.addEventListener(
+              "abort",
+              () => reject(new Error("proxy request aborted")),
+              { once: true },
+            );
+          });
+
+          try {
+            await (signal ? Promise.race([sent, aborted]) : sent);
+            // The response is out. Removing the widget and reporting it can no
+            // longer race the answer the widget is waiting for.
+            if ((getAgent()?.threadId || "default") === capturedThreadId) {
+              void controller
+                ?.commitSignal(generation, host, removeFromStore)
+                .catch((error: unknown) => {
+                  console.error(
+                    "[MCPAppsRenderer] proxy failure report failed:",
+                    error,
+                  );
+                });
+            } else {
+              controller?.abandonSignal(generation);
+            }
+          } catch {
+            // Aborted, or the send itself failed: nothing was delivered, so
+            // nothing is explained. The widget still goes, it has no data.
+            controller?.abandonSignal(generation);
+          } finally {
+            if (requestId !== undefined) pendingSends.delete(requestId);
+            retireWidget(reason);
+          }
+        })();
+
+        return response;
       };
 
       // --- App -> host notifications ---
@@ -875,6 +1104,26 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
       };
 
       const transport = new PostMessageTransport(win, win);
+      // Wrapped before connect so a waiter learns the real outcome of the send
+      // that carries its response. `postMessage` is called synchronously inside
+      // `send`, so resolving here means the response has genuinely gone out,
+      // and a rejection is a send that failed rather than one merely delayed.
+      // No cleanup here on purpose: the waiter owns its own entry (see
+      // `pendingSends`).
+      const rawSend = transport.send.bind(transport);
+      transport.send = async (message, sendOptions) => {
+        const waiter = isJsonRpcResponse(message)
+          ? pendingSends.get(message.id)
+          : undefined;
+        try {
+          const sent = await rawSend(message, sendOptions);
+          waiter?.resolve();
+          return sent;
+        } catch (error) {
+          waiter?.reject(error);
+          throw error;
+        }
+      };
       await bridge.connect(transport);
       if (disposed) {
         await bridge.close();

@@ -1,5 +1,8 @@
 import type { ActivityMessage } from "@ag-ui/core";
 import { DEFAULT_AGENT_ID } from "@copilotkit/shared";
+// Bridge-free entry: keeps the MCP Apps host (and the ext-apps bundle it pulls)
+// out of an app that renders no MCP activity.
+import { MCPAppsActivityType as MCP_APPS_ACTIVITY_TYPE } from "@copilotkit/mcp-apps-renderer/activity";
 import { useCopilotKit, useCopilotChatConfiguration } from "../providers";
 import { useCallback, useMemo } from "react";
 import type { ReactActivityMessageRenderer } from "../types";
@@ -55,7 +58,14 @@ export function useRenderActivityMessage() {
           `Failed to parse content for activity message '${message.activityType}':`,
           parseResult.issues,
         );
-        return null;
+        // An MCP Apps activity is still handed to its renderer, which owns the
+        // failure lifecycle and re-validates for itself. Returning null here
+        // would drop it for good: the widget would never mount, so nothing
+        // could ever decide whether the content is merely mid-stream, remove
+        // the widget, or tell the user why it is missing.
+        if (message.activityType !== MCP_APPS_ACTIVITY_TYPE) {
+          return null;
+        }
       }
 
       const Component = renderer.render;
@@ -65,7 +75,7 @@ export function useRenderActivityMessage() {
         <Component
           key={message.id}
           activityType={message.activityType}
-          content={parseResult.value}
+          content={parseResult.issues ? message.content : parseResult.value}
           message={message}
           agent={agent}
         />

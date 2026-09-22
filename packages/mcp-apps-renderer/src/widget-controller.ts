@@ -122,9 +122,8 @@ interface Entry {
 }
 
 /**
- * Entries that may be forgotten under pressure, capped per agent. Only entries
- * that never reserved anything qualify: forgetting one costs a fresh generation
- * on the next observation and nothing else.
+ * Soft cap on entries kept per agent. Soft because only some entries may ever
+ * be forgotten, see {@link evictForgettable}.
  */
 const MAX_FORGETTABLE_ENTRIES = 500;
 
