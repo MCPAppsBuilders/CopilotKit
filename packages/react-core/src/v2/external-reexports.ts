@@ -95,6 +95,7 @@ export type {
   ActionFromCreators,
   ActionGroupConfig,
   ActionGroupResult,
+  ActivityExchangeState,
   AnyAction,
   CopilotKitCoreAddAgentParams,
   CopilotKitCoreCatalogComponent,
