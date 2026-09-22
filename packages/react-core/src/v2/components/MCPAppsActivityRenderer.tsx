@@ -26,6 +26,10 @@ export type {
   ɵMcpFollowUpHost,
 } from "@copilotkit/mcp-apps-renderer/activity";
 
+import {
+  ɵmarkHandlesInvalidMCPAppsContent,
+  ɵmcpAppsIdentityKey,
+} from "@copilotkit/mcp-apps-renderer/activity";
 import type { MCPAppsActivityContent } from "@copilotkit/mcp-apps-renderer/activity";
 // Type-only imports: erased at build, so they never pull the ext-apps bridge
 // into the bundle. Only the dynamic import() below does, and only lazily.
@@ -69,7 +73,16 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
     // Terminal removal, decided by the shared controller. Separate from
     // `error`: that one leaves a message on screen until a re-bind, this one
     // means there is nothing left to show at all.
-    const [removed, setRemoved] = useState(false);
+    //
+    // Recorded against the identity of the exchange that was removed, not as a
+    // bare flag: a removal is a verdict on ONE widget. The same activity may
+    // later carry a different resource (an external prop swapping widgets),
+    // and that new exchange has every right to mount. A bare flag would keep
+    // the component blank forever: its effect would find no container and
+    // stop before ever binding again.
+    const [removedFor, setRemovedFor] = useState<string | null>(null);
+    const identityKey = ɵmcpAppsIdentityKey(content);
+    const removed = removedFor === identityKey;
     const [isLoading, setIsLoading] = useState(true);
     const [iframeSize, setIframeSize] = useState<{
       width?: number;
@@ -101,6 +114,9 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
       }
 
       let mounted = true;
+      // The identity this bind is for. A removal reported later belongs to
+      // it, whatever the content prop says by then.
+      const boundKey = ɵmcpAppsIdentityKey(contentRef.current);
       setIsLoading(true);
       setError(null);
       setContentError(null);
@@ -164,6 +180,11 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
                 currentAgent,
               );
             },
+            // A run ending with unchanged content leaves the controller on a
+            // provisional observation. This subscription re-reads the store so
+            // the controller sees the now-settled exchange state.
+            subscribeRunSettled: (callback) =>
+              copilotkit.subscribe({ onActivityRunSettled: callback }),
             hooks: {
               onResource: (resource) => {
                 if (!mounted) return;
@@ -174,7 +195,7 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
               // the element, so it is the only one that can take it off screen.
               onRemoved: () => {
                 if (!mounted) return;
-                setRemoved(true);
+                setRemovedFor(boundKey);
               },
               onSizeChanged: (size) => {
                 if (mounted) setIframeSize(size);
@@ -261,9 +282,11 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
           }
         : {};
 
-    // Terminal removal: render nothing at all. The container going away takes
-    // the iframe the effect mounted inside it with it, which is what keeps a
-    // disconnected frame from being left on screen.
+    // Terminal removal of THIS exchange: render nothing at all. The container
+    // going away takes the iframe the effect mounted inside it with it, which
+    // is what keeps a disconnected frame from being left on screen. A new
+    // identity renders the container again, and the bind effect (keyed on the
+    // identity) takes it from there.
     if (removed) {
       return null;
     }
@@ -291,3 +314,7 @@ export const MCPAppsActivityRenderer: React.FC<MCPAppsActivityRendererProps> =
       </div>
     );
   };
+
+// This renderer owns the MCP Apps failure lifecycle, so the dispatcher must
+// hand it content the schema rejected instead of dropping the message.
+ɵmarkHandlesInvalidMCPAppsContent(MCPAppsActivityRenderer);

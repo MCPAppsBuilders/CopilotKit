@@ -1093,6 +1093,225 @@ describe("MCP Apps Activity Renderer E2E", () => {
     });
   });
 
+  // The failure lifecycle, through the real chat, the real core run tracking
+  // and the real session. Nothing is mocked below the agent: the exchange state
+  // the session acts on comes from core.getActivityExchangeState, fed by the
+  // events these tests emit.
+  describe("Failure lifecycle", () => {
+    /**
+     * Render the chat, send a user message so a run exists, then hand back the
+     * pieces the scenarios assert on: the agent (whose `messages` store the
+     * session mutates) and a counter of the explanation runs the host started.
+     */
+    async function startChat(agent: MockMCPProxyAgent, userMessage: string) {
+      const agentId = testId("mcp-failure-agent");
+      agent.agentId = agentId;
+      renderWithCopilotKit({ agents: { [agentId]: agent }, agentId });
+
+      const box = await screen.findByRole("textbox");
+      fireEvent.change(box, { target: { value: userMessage } });
+      fireEvent.keyDown(box, { key: "Enter", code: "Enter" });
+      await waitFor(() => {
+        expect(screen.getByText(userMessage)).toBeDefined();
+      });
+
+      // Count the runs the failure lifecycle starts: an explanation run is
+      // the one requested right after the developer message was added, so it
+      // is the non-proxied run whose last stored message is that message. It
+      // is acknowledged as a finished run would be, rather than streamed: this
+      // mock's event stream never completes, so a real run would never
+      // resolve, and the shared MCP request queue serializes the explanation
+      // with every proxied request of the same agent. A hanging explanation
+      // would hold the next widget's resource fetch forever, which is the
+      // mock's artifact, not the contract under test. User turns keep their
+      // real pipeline, since that is what applies the agent's events.
+      const explanationRuns: Array<Partial<RunAgentInput> | undefined> = [];
+      const original = agent.runAgent.bind(agent);
+      agent.runAgent = async (
+        input?: Partial<RunAgentInput>,
+      ): Promise<RunAgentResult> => {
+        if (
+          !input?.forwardedProps?.__proxiedMCPRequest &&
+          agent.messages.at(-1)?.role === "developer"
+        ) {
+          explanationRuns.push(input);
+          return { result: undefined, newMessages: [] };
+        }
+        return original(input);
+      };
+
+      const developerMessages = () =>
+        agent.messages.filter((m) => m.role === "developer");
+      const activityInStore = (id: string) =>
+        agent.messages.some((m) => m.id === id);
+      const resourceReads = (uri?: string) =>
+        agent.runAgentCalls.filter((call) => {
+          const req = call.input.forwardedProps?.__proxiedMCPRequest as
+            | { method?: string; params?: { uri?: string } }
+            | undefined;
+          return (
+            req?.method === "resources/read" &&
+            (uri === undefined || req.params?.uri === uri)
+          );
+        });
+
+      /** Send another user message, which starts the agent's next run. */
+      const followUp = async (text: string) => {
+        const field = await screen.findByRole("textbox");
+        fireEvent.change(field, { target: { value: text } });
+        fireEvent.keyDown(field, { key: "Enter", code: "Enter" });
+        await waitFor(() => {
+          expect(screen.getByText(text)).toBeDefined();
+        });
+      };
+
+      return {
+        explanationRuns,
+        developerMessages,
+        activityInStore,
+        resourceReads,
+        followUp,
+      };
+    }
+
+    it("removes a widget whose tool errored once the run settles, and asks the agent to explain once", async () => {
+      const agent = new MockMCPProxyAgent();
+      const chat = await startChat(agent, "Book a flight");
+      const activityMessageId = testId("mcp-failed");
+
+      agent.emit(runStartedEvent());
+      agent.emit(
+        activitySnapshotEvent({
+          messageId: activityMessageId,
+          activityType: MCPAppsActivityType,
+          content: mcpAppsActivityContent({
+            resourceUri: "ui://booking/form",
+            serverHash: "booking-hash",
+            result: {
+              content: [{ type: "text", text: "The backend refused." }],
+              isError: true,
+            },
+          }),
+        }),
+      );
+      agent.emit(runFinishedEvent());
+
+      // Terminal at mount: the run is already over when the renderer binds, so
+      // the widget never fetches, never shows, and the agent is told once.
+      await waitFor(() => {
+        expect(chat.developerMessages()).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(chat.explanationRuns).toHaveLength(1);
+      });
+      expect(document.querySelector("iframe")).toBeNull();
+      expect(chat.resourceReads()).toHaveLength(0);
+      expect(chat.activityInStore(activityMessageId)).toBe(false);
+      expect(chat.developerMessages()[0]!.content).toContain(
+        "The interface for it was removed",
+      );
+    });
+
+    it("keeps a provisional fragment mounted, then removes and explains it when the run ends without another update", async () => {
+      const agent = new MockMCPProxyAgent();
+      const chat = await startChat(agent, "Show the dashboard");
+      const activityMessageId = testId("mcp-fragment");
+
+      // A fragment with a usable identity but no result yet, mid-run.
+      agent.emit(runStartedEvent());
+      agent.emit(
+        activitySnapshotEvent({
+          messageId: activityMessageId,
+          activityType: MCPAppsActivityType,
+          content: {
+            resourceUri: "ui://dashboard/main",
+            serverHash: "dashboard-hash",
+            toolInput: { range: "7d" },
+          },
+        }),
+      );
+
+      // Provisional: the widget mounts and waits. Its resource fetch is queued
+      // behind the open run (the shared queue only proxies to an idle agent),
+      // so the frame exists but has not loaded, and nothing is reported.
+      await waitFor(() => {
+        expect(document.querySelector("iframe")).not.toBeNull();
+      });
+      expect(document.querySelector("iframe[srcdoc]")).toBeNull();
+      expect(chat.developerMessages()).toHaveLength(0);
+      expect(chat.explanationRuns).toHaveLength(0);
+
+      // The run ends and the fragment never completed. No content changed, so
+      // only the run-settled notification can tell the session to look again.
+      agent.emit(runFinishedEvent());
+
+      await waitFor(() => {
+        expect(document.querySelector("iframe")).toBeNull();
+      });
+      await waitFor(() => {
+        expect(chat.developerMessages()).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(chat.explanationRuns).toHaveLength(1);
+      });
+      expect(chat.activityInStore(activityMessageId)).toBe(false);
+    });
+
+    it("mounts a new widget when the same activity comes back with a different resource, without a second report", async () => {
+      const agent = new MockMCPProxyAgent();
+      const chat = await startChat(agent, "Try again");
+      const { followUp } = chat;
+      const activityMessageId = testId("mcp-retry");
+
+      agent.emit(runStartedEvent());
+      agent.emit(
+        activitySnapshotEvent({
+          messageId: activityMessageId,
+          activityType: MCPAppsActivityType,
+          content: mcpAppsActivityContent({
+            resourceUri: "ui://booking/form",
+            serverHash: "booking-hash",
+            result: { content: [], isError: true },
+          }),
+        }),
+      );
+      agent.emit(runFinishedEvent());
+      await waitFor(() => {
+        expect(chat.developerMessages()).toHaveLength(1);
+      });
+      expect(document.querySelector("iframe")).toBeNull();
+
+      // On the user's next turn, the agent answers with a different widget for
+      // the same activity. That is a new exchange: it gets its own mount and
+      // its own fetch. The turn starts a real run, as it would in production:
+      // each run's pipeline is seeded from the current store and owns it.
+      await followUp("Show me the confirmation instead");
+      agent.emit(runStartedEvent());
+      agent.emit(
+        activitySnapshotEvent({
+          messageId: activityMessageId,
+          activityType: MCPAppsActivityType,
+          content: mcpAppsActivityContent({
+            resourceUri: "ui://booking/confirmation",
+            serverHash: "booking-hash",
+          }),
+        }),
+      );
+      agent.emit(runFinishedEvent());
+
+      await waitFor(() => {
+        expect(chat.resourceReads("ui://booking/confirmation")).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(document.querySelector("iframe[srcdoc]")).not.toBeNull();
+      });
+      // The earlier failure was explained once; the new exchange, which is
+      // fine, adds nothing.
+      expect(chat.developerMessages()).toHaveLength(1);
+      expect(chat.explanationRuns).toHaveLength(1);
+    });
+  });
+
   describe("Surface contract", () => {
     // The shared harness probe
     // (`showcase/harness/src/probes/scripts/d5-mcp-apps.ts`) settles the turn on

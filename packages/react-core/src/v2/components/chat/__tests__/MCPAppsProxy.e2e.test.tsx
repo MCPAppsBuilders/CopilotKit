@@ -534,6 +534,73 @@ describe("MCP Apps Proxy E2E", () => {
     });
   });
 
+  describe("tools/call failure lifecycle", () => {
+    it("answers a failing tools/call before the widget is removed, then explains it once", async () => {
+      const agent = new MockMCPProxyAgent();
+      agent.agentId = "proxy-tools-failure";
+
+      const iframe = await setupMCPActivity(
+        agent,
+        "proxy-tools-failure",
+        "Tools failure test",
+      );
+
+      // Record, for every message posted to the widget, whether its iframe
+      // was still on screen at that moment. The response must go out while it
+      // is; removal may only follow.
+      const posted: Array<{ message: any; attached: boolean }> = [];
+      const cw = iframe.contentWindow!;
+      const origPostMessage = cw.postMessage.bind(cw);
+      cw.postMessage = function (message: unknown, ...args: unknown[]) {
+        posted.push({ message, attached: document.body.contains(iframe) });
+        return (origPostMessage as Function)(message, ...args);
+      };
+
+      const originalRunAgent = agent.runAgent.bind(agent);
+      agent.runAgent = async (
+        input?: Partial<RunAgentInput>,
+      ): Promise<RunAgentResult> => {
+        const proxiedRequest = input?.forwardedProps?.__proxiedMCPRequest as
+          | { method: string }
+          | undefined;
+        if (proxiedRequest?.method === "tools/call") {
+          return {
+            result: {
+              content: [{ type: "text", text: "Payment declined." }],
+              isError: true,
+            },
+            newMessages: [],
+          };
+        }
+        return originalRunAgent(input);
+      };
+
+      const reqId = testId("req");
+      await sendJsonRpc(iframe, reqId, "tools/call", {
+        name: "pay",
+        arguments: {},
+      });
+
+      // The widget got the real error result, while it was still mounted.
+      const response = posted.find(
+        (p) => p.message?.jsonrpc === "2.0" && p.message?.id === reqId,
+      );
+      expect(response).toBeDefined();
+      expect(response!.message.result).toMatchObject({ isError: true });
+      expect(response!.attached).toBe(true);
+
+      // Then, and only then, the widget goes and the agent is told once.
+      await waitFor(() => {
+        expect(document.body.contains(iframe)).toBe(false);
+      });
+      await waitFor(() => {
+        expect(
+          agent.messages.filter((m) => m.role === "developer"),
+        ).toHaveLength(1);
+      });
+    });
+  });
+
   describe("Multiple independent MCP activities", () => {
     it("renders two activities with different resourceUris independently", async () => {
       const agent = new MockMCPProxyAgent();
