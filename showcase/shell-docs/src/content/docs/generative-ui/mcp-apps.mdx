@@ -82,6 +82,46 @@ Use this format to connect to an MCP server that streams events over a persisten
 }
 ```
 
+## When a widget cannot be shown
+
+A tool can return a result its widget cannot use: a result the MCP contract
+rejects, a `CallToolResult` with `isError: true`, or a failing call the widget
+made itself through the `tools/call` proxy. In each case CopilotKit does three
+things, in every frontend (React, Vue and Angular):
+
+1. **The widget comes off screen.** A widget that is still receiving its result
+   is kept while the run is open; the decision is taken only once the run that
+   produced the activity has ended. A widget that fails a call it made itself
+   receives the error response first, then is removed.
+2. **The activity is removed from the conversation store** when it lives there,
+   so it does not come back on the next render or on reload. Activities you
+   render from your own message list are left untouched; only the widget is
+   removed.
+3. **The agent is asked to explain.** CopilotKit adds a `developer`-role
+   message stating which widget failed and that its interface was removed, and
+   runs the agent once so the explanation reaches the user in the chat. This
+   happens once per failure, and never for activities replayed from history.
+
+<Callout type="warn" title="BuiltInAgent needs forwardDeveloperMessages">
+  `BuiltInAgent` does not forward `developer` messages to the model unless
+  configured to. Without it the widget is removed and the message is in the
+  conversation, but the model never reads it and the user gets no explanation:
+
+  ```typescript
+  const agent = new BuiltInAgent({
+    model: "openai:gpt-5.4-mini",
+    forwardDeveloperMessages: true,
+  });
+  ```
+
+  A custom agent must forward `developer` messages to its model for the
+  explanation to happen. See [Message forwarding](/integrations/built-in-agent/advanced-configuration#message-forwarding).
+</Callout>
+
+The explanation costs one extra model turn per failed widget. Results that
+merely do not match an application-level `outputSchema` are not failures: they
+are forwarded to the widget as they stand.
+
 ## Example MCP servers
 
 Try these open-source MCP Apps servers to get started:

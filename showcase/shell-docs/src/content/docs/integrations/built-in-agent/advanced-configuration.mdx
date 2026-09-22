@@ -119,6 +119,16 @@ const agent = new BuiltInAgent({
 });
 ```
 
+<Callout type="warn" title="Required for MCP Apps failure explanations">
+  When an MCP Apps widget cannot be shown (invalid result, tool error, failing
+  widget-initiated call), CopilotKit removes the widget and adds a
+  `developer`-role message asking the agent to tell the user what happened.
+  `BuiltInAgent` drops `developer` messages by default, so without
+  `forwardDeveloperMessages: true` the widget disappears silently. Set it on
+  every `BuiltInAgent` that serves MCP Apps. See
+  [When a widget cannot be shown](/generative-ui/mcp-apps#when-a-widget-cannot-be-shown).
+</Callout>
+
 ## Full configuration reference
 
 | Property | Type | Default | Description |
