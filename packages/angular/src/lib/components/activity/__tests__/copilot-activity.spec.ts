@@ -1,8 +1,14 @@
-import { Component, signal } from "@angular/core";
+import { Component, computed, input, signal } from "@angular/core";
 import { TestBed } from "@angular/core/testing";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { ActivityMessage } from "@ag-ui/core";
+import type { AbstractAgent } from "@ag-ui/client";
+import {
+  MCPAppsActivityContentSchema,
+  ɵmarkHandlesInvalidMCPAppsContent,
+} from "@copilotkit/mcp-apps-renderer/activity";
+import type { ActivityRenderer } from "../../../activity-renderer";
 import { CopilotActivity } from "../copilot-activity";
 import { CopilotKit } from "../../../copilotkit";
 import { anyActivityContentSchema } from "../../../activity-renderer";
@@ -22,6 +28,33 @@ class ActivityHostComponent {
   message!: ActivityMessage;
   agentId: string | undefined = undefined;
 }
+
+/**
+ * Stands in for the built-in MCP Apps renderer: marked as owning the failure
+ * lifecycle, so the dispatcher must hand it content the schema rejected.
+ */
+@Component({
+  selector: "marked-mcp-apps-renderer",
+  template: `
+    <div
+      data-testid="marked-mcp-activity"
+      [attr.data-content]="contentJson()"
+    ></div>
+  `,
+})
+class MarkedMcpAppsRenderer implements ActivityRenderer {
+  readonly activityType = input.required<string>();
+  readonly content = input.required<unknown>();
+  readonly message = input.required<ActivityMessage>();
+  readonly agent = input<AbstractAgent | undefined>();
+  protected readonly contentJson = computed(() =>
+    JSON.stringify(this.content()),
+  );
+}
+ɵmarkHandlesInvalidMCPAppsContent(MarkedMcpAppsRenderer);
+
+// Fails the MCP Apps schema: `serverHash` is required.
+const invalidMcpContent = { resourceUri: "ui://server/app" };
 
 const activityMessage = (
   overrides: Partial<ActivityMessage> = {},
@@ -150,5 +183,53 @@ describe("CopilotActivity", () => {
 
     expect(host.querySelector('[data-testid="primary-activity"]')).toBeNull();
     expect((host.textContent ?? "").trim()).toBe("");
+  });
+
+  // The MCP Apps renderer owns the failure lifecycle, so it must receive
+  // content the schema rejected instead of being skipped: dropping it here
+  // would mean the widget never mounts, so nothing could decide whether the
+  // content is mid-stream, retire the widget, or explain its absence. The
+  // exception is granted by a mark on the renderer, never inferred from its
+  // schema, which is public and may be reused by a custom renderer.
+  it("hands a marked MCP Apps renderer content the schema rejected", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderers.set([
+      {
+        activityType: "mcp-apps",
+        content: MCPAppsActivityContentSchema,
+        component: MarkedMcpAppsRenderer,
+      },
+    ]);
+
+    const host = render(
+      activityMessage({ activityType: "mcp-apps", content: invalidMcpContent }),
+    );
+
+    const rendered = host.querySelector<HTMLElement>(
+      '[data-testid="marked-mcp-activity"]',
+    );
+    expect(rendered).not.toBeNull();
+    expect(rendered?.getAttribute("data-content")).toBe(
+      JSON.stringify(invalidMcpContent),
+    );
+    warn.mockRestore();
+  });
+
+  it("skips an unmarked renderer that merely reuses the public MCP Apps schema", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderers.set([
+      {
+        activityType: "mcp-apps",
+        content: MCPAppsActivityContentSchema,
+        component: PrimaryActivityRenderer,
+      },
+    ]);
+
+    const host = render(
+      activityMessage({ activityType: "mcp-apps", content: invalidMcpContent }),
+    );
+
+    expect(host.querySelector('[data-testid="primary-activity"]')).toBeNull();
+    warn.mockRestore();
   });
 });

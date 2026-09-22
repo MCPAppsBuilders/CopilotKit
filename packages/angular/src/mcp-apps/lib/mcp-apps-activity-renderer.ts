@@ -4,6 +4,7 @@ import type {
   ActivityRenderer,
   RenderActivityMessageConfig,
 } from "@copilotkit/angular";
+import { ɵmarkHandlesInvalidMCPAppsContent } from "@copilotkit/mcp-apps-renderer/activity";
 import {
   mcpAppsSnapshotContentSchema,
   type MCPAppsSnapshotContent,
@@ -33,6 +34,10 @@ export class CopilotMCPAppsActivityRenderer implements ActivityRenderer<MCPAppsS
   readonly message = input.required<ActivityMessage>();
   readonly agent = input<AbstractAgent | undefined>();
 }
+
+// This renderer owns the MCP Apps failure lifecycle, so the dispatcher must
+// hand it content the schema rejected instead of dropping the message.
+ɵmarkHandlesInvalidMCPAppsContent(CopilotMCPAppsActivityRenderer);
 
 /**
  * Ready-to-register render config for `mcp-apps` activity messages. Pass it

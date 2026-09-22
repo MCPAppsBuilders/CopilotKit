@@ -38,9 +38,13 @@ function createAgent(resourceText = "<h1>MCP App</h1>"): AgentHarness {
     onRunFailed?: () => void;
   }> = [];
   const agent = {
+    agentId: "agent-1",
     threadId: "thread-1",
     isRunning: false,
-    messages: [],
+    messages: [] as unknown[],
+    setMessages(messages: unknown[]) {
+      this.messages = messages;
+    },
     addMessage: vi.fn(),
     subscribe: vi.fn(
       (subscriber: {
@@ -93,11 +97,45 @@ function createAgent(resourceText = "<h1>MCP App</h1>"): AgentHarness {
   return agent as unknown as AgentHarness;
 }
 
+/**
+ * The slice of `CopilotKitCore` the widget touches: it runs follow-ups and
+ * explanations through `runAgent`, asks how final an activity's content is,
+ * and listens for runs settling.
+ */
+type ExchangeState = "unknown" | "pending" | "settled" | "untracked";
+
+function coreStub(
+  runAgent = vi.fn(async () => ({ result: undefined, newMessages: [] })),
+  exchangeState: ExchangeState = "unknown",
+) {
+  const settledCallbacks: Array<() => void> = [];
+  let state = exchangeState;
+  return {
+    runAgent,
+    getActivityExchangeState: vi.fn(() => state),
+    subscribe: vi.fn((subscriber: { onActivityRunSettled?: () => void }) => {
+      if (subscriber.onActivityRunSettled) {
+        settledCallbacks.push(subscriber.onActivityRunSettled);
+      }
+      return { unsubscribe: vi.fn() };
+    }),
+    /** What the core would answer from here on. */
+    setExchangeState(next: ExchangeState) {
+      state = next;
+    },
+    /** Fire every run-settled subscription, as the core would at run end. */
+    settleRuns() {
+      for (const callback of settledCallbacks.slice()) callback();
+    },
+  };
+}
+
 function configureTestingModule(
   runAgent = vi.fn(async () => ({ result: undefined, newMessages: [] })),
   idleTimeoutMs = 30_000,
   initializationTimeoutMs = 30_000,
-): void {
+  core = coreStub(runAgent),
+): typeof core {
   TestBed.resetTestingModule();
   TestBed.configureTestingModule({
     providers: [
@@ -107,10 +145,11 @@ function configureTestingModule(
       }),
       {
         provide: CopilotKit,
-        useValue: { core: { runAgent } },
+        useValue: { core },
       },
     ],
   });
+  return core;
 }
 
 async function settle(fixture: {
@@ -748,6 +787,255 @@ test("reads store updates by message id and recovers from invalid content", asyn
     }),
     "*",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Failure lifecycle, through the real shared session: the widget must hand the
+// session the core's run tracking (`getExchangeState`, `subscribeRunSettled`)
+// and act on its verdict (`onRemoved`). Without that wiring every activity
+// error reads as `unknown` and is never terminal, and a retirement decided by
+// the session never leaves the screen.
+// ---------------------------------------------------------------------------
+
+const failedSnapshot: MCPAppsSnapshotContent = {
+  ...snapshot,
+  result: { content: [], isError: true },
+};
+
+async function bootFailedWidget(core: ReturnType<typeof coreStub>) {
+  const agent = createAgent();
+  agent.messages = [
+    {
+      id: "act-1",
+      role: "activity",
+      activityType: "mcp-apps",
+      content: failedSnapshot,
+    },
+  ];
+  const fixture = TestBed.createComponent(CopilotMCPAppsWidget);
+  fixture.componentRef.setInput("data", failedSnapshot);
+  fixture.componentRef.setInput("agent", agent);
+  fixture.componentRef.setInput("messageId", "act-1");
+  await settle(fixture);
+  await waitFor(
+    () => (core.runAgent as ReturnType<typeof vi.fn>).mock.calls.length === 1,
+    "the explanation run never started",
+  );
+  await settle(fixture);
+  return { agent, fixture };
+}
+
+test("removes the widget and explains a tool error that was already settled at bind", async () => {
+  const explain = vi.fn(async () => ({ result: undefined, newMessages: [] }));
+  const core = configureTestingModule(
+    explain,
+    30_000,
+    30_000,
+    coreStub(explain, "settled"),
+  );
+  const { agent, fixture } = await bootFailedWidget(core);
+
+  // Off screen, and never fetched: the controller refused the mount.
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).toBeNull();
+  expect(
+    agent.runAgent.mock.calls.filter(
+      ([input]) =>
+        input?.forwardedProps?.__proxiedMCPRequest?.method === "resources/read",
+    ),
+  ).toHaveLength(0);
+  // Removed from the store, explained once, in one run.
+  expect(agent.messages).toEqual([]);
+  expect(agent.addMessage).toHaveBeenCalledTimes(1);
+  expect(agent.addMessage.mock.calls[0]?.[0]).toMatchObject({
+    role: "developer",
+  });
+  expect(explain).toHaveBeenCalledTimes(1);
+  expect(explain).toHaveBeenCalledWith({ agent });
+  // The verdict came from the core's run tracking, not a default.
+  expect(core.getActivityExchangeState).toHaveBeenCalledWith(
+    "agent-1",
+    "thread-1",
+    "act-1",
+    agent,
+  );
+  expect(core.subscribe).toHaveBeenCalledWith(
+    expect.objectContaining({ onActivityRunSettled: expect.any(Function) }),
+  );
+});
+
+test("stays removed for the same resource, and mounts again for a different one", async () => {
+  const explain = vi.fn(async () => ({ result: undefined, newMessages: [] }));
+  const core = configureTestingModule(
+    explain,
+    30_000,
+    30_000,
+    coreStub(explain, "settled"),
+  );
+  const { agent, fixture } = await bootFailedWidget(core);
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).toBeNull();
+
+  // Same widget, a later update: the removed exchange stays removed.
+  fixture.componentRef.setInput("data", {
+    ...failedSnapshot,
+    result: { content: [{ type: "text", text: "late" }] },
+  });
+  await settle(fixture);
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).toBeNull();
+  expect(explain).toHaveBeenCalledTimes(1);
+
+  // A different resource is a new exchange: it gets its frame and is fetched.
+  const other = { ...snapshot, resourceUri: "ui://demo/other.html" };
+  fixture.componentRef.setInput("data", other);
+  await settle(fixture);
+  await waitFor(
+    () =>
+      agent.runAgent.mock.calls.some(
+        ([input]) =>
+          input?.forwardedProps?.__proxiedMCPRequest?.method ===
+            "resources/read" &&
+          input?.forwardedProps?.__proxiedMCPRequest?.params?.uri ===
+            other.resourceUri,
+      ),
+    "the new exchange was never fetched",
+  );
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).not.toBeNull();
+});
+
+test("keeps a provisional fragment mounted, then removes and explains it when the run ends without another update", async () => {
+  const explain = vi.fn(async () => ({ result: undefined, newMessages: [] }));
+  const core = configureTestingModule(
+    explain,
+    30_000,
+    30_000,
+    coreStub(explain, "pending"),
+  );
+  const agent = createAgent();
+  // A usable identity but no result yet, while the run is still open.
+  const fragment = {
+    resourceUri: snapshot.resourceUri,
+    serverHash: snapshot.serverHash,
+    serverId: snapshot.serverId,
+    toolInput: { city: "Paris" },
+  } as unknown as MCPAppsSnapshotContent;
+  agent.messages = [
+    {
+      id: "act-1",
+      role: "activity",
+      activityType: "mcp-apps",
+      content: fragment,
+    },
+  ];
+  const fixture = TestBed.createComponent(CopilotMCPAppsWidget);
+  fixture.componentRef.setInput("data", fragment);
+  fixture.componentRef.setInput("agent", agent);
+  fixture.componentRef.setInput("messageId", "act-1");
+  await settle(fixture);
+  const frame = fixture.nativeElement.querySelector<HTMLIFrameElement>(
+    "[data-testid='mcp-app-iframe']",
+  );
+  if (!frame) throw new Error("MCP Apps iframe was not created");
+  await waitFor(
+    () => frame.srcdoc.includes("sandbox-proxy-ready"),
+    "sandbox proxy was not installed",
+  );
+
+  // Provisional: mounted, fetched, nothing reported.
+  expect(explain).not.toHaveBeenCalled();
+  expect(agent.addMessage).not.toHaveBeenCalled();
+
+  // The run ends and the fragment never completed. No content changed, so only
+  // the run-settled notification can tell the session to look again.
+  core.setExchangeState("settled");
+  core.settleRuns();
+  await waitFor(
+    () => explain.mock.calls.length === 1,
+    "explanation did not run",
+  );
+  await settle(fixture);
+
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).toBeNull();
+  expect(agent.messages).toEqual([]);
+  expect(agent.addMessage).toHaveBeenCalledTimes(1);
+  expect(agent.addMessage.mock.calls[0]?.[0]).toMatchObject({
+    role: "developer",
+  });
+});
+
+test("answers a failing tools/call before the frame is removed, then explains it once", async () => {
+  const explain = vi.fn(async () => ({ result: undefined, newMessages: [] }));
+  configureTestingModule(explain);
+  const agent = createAgent();
+  agent.messages = [
+    {
+      id: "act-1",
+      role: "activity",
+      activityType: "mcp-apps",
+      content: snapshot,
+    },
+  ];
+  const { fixture, frame } = await bootWidget(agent, "act-1");
+
+  // Record, for every message posted to the widget, whether its frame was
+  // still on screen at that moment. The response must go out while it is;
+  // removal may only follow.
+  const posted: Array<{ message: Record<string, any>; attached: boolean }> = [];
+  const cw = frame.contentWindow!;
+  const origPostMessage = cw.postMessage.bind(cw);
+  cw.postMessage = ((message: unknown, ...args: unknown[]) => {
+    posted.push({
+      message: message as Record<string, any>,
+      attached: fixture.nativeElement.contains(frame),
+    });
+    return (origPostMessage as (...a: unknown[]) => void)(message, ...args);
+  }) as typeof cw.postMessage;
+
+  agent.runAgent.mockImplementationOnce(async () => ({
+    result: {
+      content: [{ type: "text", text: "Payment declined." }],
+      isError: true,
+    },
+    newMessages: [],
+  }));
+
+  dispatchFrameMessage(frame, {
+    jsonrpc: "2.0",
+    id: "pay-1",
+    method: "tools/call",
+    params: { name: "pay", arguments: {} },
+  });
+  await waitFor(
+    () => posted.some((p) => p.message?.id === "pay-1"),
+    "the failing tools/call was never answered",
+  );
+
+  // The widget got the real error result, while it was still mounted.
+  const response = posted.find((p) => p.message?.id === "pay-1")!;
+  expect(response.message.result).toMatchObject({ isError: true });
+  expect(response.attached).toBe(true);
+
+  // Then, and only then, the frame goes and the agent is told once.
+  await waitFor(
+    () => explain.mock.calls.length === 1,
+    "explanation did not run",
+  );
+  await settle(fixture);
+  expect(
+    fixture.nativeElement.querySelector("[data-testid='mcp-app-iframe']"),
+  ).toBeNull();
+  expect(agent.addMessage).toHaveBeenCalledTimes(1);
+  expect(agent.addMessage.mock.calls[0]?.[0]).toMatchObject({
+    role: "developer",
+  });
 });
 
 test("reports failed follow-ups through the Angular error UI", async () => {
