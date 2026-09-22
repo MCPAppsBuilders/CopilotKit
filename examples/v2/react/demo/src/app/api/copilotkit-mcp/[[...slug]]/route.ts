@@ -24,6 +24,9 @@ const agent = new BasicAgent({
   model: determineModel(),
   prompt: "You are a helpful AI assistant with access to MCP apps and tools.",
   temperature: 0.7,
+  // The failure lifecycle injects developer-role messages to tell the model
+  // about widget errors. Without this flag, BuiltInAgent silently drops them.
+  forwardDeveloperMessages: true,
 }).use(
   new MCPAppsMiddleware({
     // Port assignments - verified by checking each server's tools
