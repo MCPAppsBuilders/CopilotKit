@@ -36,7 +36,10 @@ import type {
   RuntimeEntitlementResponse,
 } from "@copilotkit/shared";
 import { StateManager } from "./state-manager";
-import type { CopilotKitCoreContinuationHandoff } from "./state-manager";
+import type {
+  ActivityExchangeState,
+  CopilotKitCoreContinuationHandoff,
+} from "./state-manager";
 import { ThreadStoreRegistry } from "./thread-store-registry";
 import type { ɵThreadStore } from "../threads";
 import { ɵcreateMemoryStore } from "../memory";
@@ -177,6 +180,23 @@ export interface CopilotKitCoreSubscriber {
   onAgentRunStarted?: (event: {
     copilotkit: CopilotKitCore;
     agent: AbstractAgent;
+  }) => void | Promise<void>;
+  /**
+   * Fired once when a run closes, whichever way it ended (finished, errored, or
+   * finalized after an abort), with the run id already resolved the same way
+   * message/state associations resolve it, so a connect replay's server runs
+   * are reported individually rather than under the outer connection id.
+   *
+   * Consumers that showed something tied to a run (an activity renderer
+   * waiting on the run producing its content, say) use this to re-read the
+   * current value once the run can no longer change it, including when nothing
+   * changed at the end.
+   */
+  onActivityRunSettled?: (event: {
+    copilotkit: CopilotKitCore;
+    agentId: string;
+    threadId: string;
+    runId: string;
   }) => void | Promise<void>;
   onContextChanged?: (event: {
     copilotkit: CopilotKitCore;
@@ -1414,6 +1434,39 @@ export class CopilotKitCore {
       agentId,
       threadId,
       messageId,
+    );
+  }
+
+  /** True while `runId` is the run currently open on that agent's thread. */
+  isRunActive(agentId: string, threadId: string, runId: string): boolean {
+    return this.stateManager.isRunActive(agentId, threadId, runId);
+  }
+
+  /**
+   * Whether this core observes `agent`'s events: true for the subscribed
+   * instance and for any clone that inherited its subscription, false for one
+   * created before it. Callers that need to know whether an absent activity
+   * record is meaningful must check this first.
+   */
+  isAgentInstanceObserved(agentId: string, agent: AbstractAgent): boolean {
+    return this.stateManager.isAgentInstanceObserved(agentId, agent);
+  }
+
+  /**
+   * Whether an activity message is still being produced, already final, came
+   * from history, or cannot be judged. See {@link ActivityExchangeState}.
+   */
+  getActivityExchangeState(
+    agentId: string,
+    threadId: string,
+    messageId: string,
+    agent: AbstractAgent,
+  ): ActivityExchangeState {
+    return this.stateManager.getActivityExchangeState(
+      agentId,
+      threadId,
+      messageId,
+      agent,
     );
   }
 

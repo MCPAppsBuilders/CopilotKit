@@ -1,5 +1,6 @@
 import type {
   AbstractAgent,
+  AgentSubscriber,
   Message,
   State,
   RunAgentInput,
@@ -11,8 +12,27 @@ import type {
   ToolMessage,
 } from "@ag-ui/client";
 import { randomUUID, structuredClone_ } from "@ag-ui/client";
-import type { CopilotKitCore } from "./core";
+import type { CopilotKitCore, CopilotKitCoreFriendsAccess } from "./core";
 import { isForwardedToClientPlaceholder } from "./tool-result-content";
+
+/**
+ * Whether an activity message is still being produced, already final, or cannot
+ * be judged at all. Activity-type agnostic: it is derived from the AG-UI
+ * activity events themselves, so it applies to any `activityType`, not to one
+ * particular renderer.
+ *
+ * - `unknown`: the running agent instance is not the one this manager observes,
+ *   so the absence of a live-activity record proves nothing.
+ * - `untracked`: observed instance, and no dedicated activity event ever
+ *   touched this message. It came from history (`setMessages`) or a generic
+ *   `MESSAGES_SNAPSHOT`.
+ * - `pending` / `settled`: the run that last touched it is still open / is over.
+ */
+export type ActivityExchangeState =
+  | "unknown"
+  | "untracked"
+  | "pending"
+  | "settled";
 
 const isContinuation = (input: RunAgentInput): boolean =>
   input.resume !== undefined ||
@@ -57,9 +77,54 @@ export class StateManager {
   // Active run tracking: `agentId:threadId` -> runId (used when messages arrive without input)
   private activeRun: Map<string, string> = new Map();
 
+  /**
+   * Runs still producing: agentId -> threadId -> set of open runIds.
+   *
+   * Nested rather than keyed by `${agentId}:${threadId}`: an agent may legally
+   * be named `foo:bar`, and a flat key would make agent `foo`'s cleanup match
+   * (and close) agent `foo:bar`'s runs, notifying with a mangled identity.
+   *
+   * Deliberately NOT `activeRun`, whose question is "who owns a message that
+   * arrives with no input". A stream that ends without a terminal event keeps
+   * that ownership on purpose, yet is plainly no longer producing. Entries are
+   * removed on every exit path (finished, errored, finalized after an abort),
+   * so "is this run still producing" has one honest answer.
+   *
+   * A set, not a single slot: runs can overlap (a direct `agent.runAgent()`
+   * while another is in flight, or a long-lived connect pipeline alongside
+   * one). With a single slot, starting B would silently declare A's ongoing
+   * activities settled and swallow A's own close notification.
+   */
+  private openRuns: Map<string, Map<string, Set<string>>> = new Map();
+
+  /**
+   * Last dedicated activity event per message: agentId -> threadId -> messageId -> runId.
+   *
+   * Deliberately NOT `messageToRun`: that one associates a message with the run
+   * that CREATED it and never reassigns, so an activity created in run A and
+   * later patched by run B still reads as A. This map is overwritten on every
+   * ACTIVITY_SNAPSHOT/ACTIVITY_DELTA, so it always names the run currently
+   * touching the activity. Populated only by those two events, never by a
+   * generic MESSAGES_SNAPSHOT, setMessages or addMessage, which is what makes
+   * "no entry" mean "not produced live".
+   */
+  private lastActivityEventRun: Map<string, Map<string, Map<string, string>>> =
+    new Map();
+
   private agentSubscriptions: Map<
     string,
-    { agent: AbstractAgent; unsubscribe: () => void }
+    {
+      agent: AbstractAgent;
+      unsubscribe: () => void;
+      /**
+       * The exact object handed to `agent.subscribe(...)`. Coverage is measured
+       * by looking for it in an instance's own `subscribers` array: a per-thread
+       * clone made after this subscription inherits it (AbstractAgent.clone
+       * copies the array by reference) and is therefore observed, even though it
+       * is not the instance recorded here.
+       */
+      subscriber: AgentSubscriber;
+    }
   > = new Map();
 
   // Internal follow-ups are marked in memory so the marker never reaches a
@@ -125,6 +190,7 @@ export class StateManager {
       existing.unsubscribe();
       this.agentSubscriptions.delete(agentId);
     }
+    const replacedInstance = existing !== undefined;
 
     // Subscribe to agent events.
     //
@@ -247,12 +313,19 @@ export class StateManager {
       pendingResults.delete(input);
     };
 
+    // The resolved run id is bound to the execution context that produced it,
+    // not read back from `subRunId` at call time. An old pipeline can still be
+    // finalizing (see invariant 1 above) after a newer run has started; reading
+    // the mutable `subRunId` then would resolve the old run's callbacks to the
+    // NEW run id and let them close a run they never belonged to.
+    const runIdForInput = new WeakMap<RunAgentInput, string>();
+
     const effectiveInput = (input: RunAgentInput): RunAgentInput => ({
       ...input,
-      runId: subRunId ?? input.runId,
+      runId: runIdForInput.get(input) ?? subRunId ?? input.runId,
     });
 
-    const { unsubscribe } = agent.subscribe({
+    const subscriber: AgentSubscriber = {
       onRunStartedEvent: ({ event, input, state }) => {
         if (revoked) return;
         const pendingForAgent = this.pendingContinuations.get(agent);
@@ -284,6 +357,7 @@ export class StateManager {
           subRunId = event.runId || input.runId;
         }
         runFinished = false;
+        runIdForInput.set(input, subRunId);
         this.handleRunStarted(agent, effectiveInput(input), state);
       },
       onRunFinishedEvent: ({ input, state, messages }) => {
@@ -308,9 +382,38 @@ export class StateManager {
         if (revoked) return;
         return reconcilePendingResults(messages, input);
       },
+      // Runs on success, error AND unsubscription/abort, so it is the only hook
+      // that closes a run the transport dropped without a terminal event.
       onRunFinalized: ({ input }) => {
         if (revoked) return;
         clearPendingResults(input);
+        // Only a context that actually started a run has one to close. A run
+        // that failed before RUN_STARTED never owned the thread's slot, and
+        // resolving it through the fallback would name (and close) whichever
+        // run is currently active instead.
+        const ownRunId = runIdForInput.get(input);
+        if (ownRunId === undefined) return;
+        this.closeEffectiveRun(agent.agentId!, input.threadId, ownRunId);
+      },
+      onActivitySnapshotEvent: ({ event, input }) => {
+        if (revoked) return;
+        const effective = effectiveInput(input);
+        this.recordActivityEventRun(
+          agent.agentId!,
+          effective.threadId,
+          event.messageId,
+          effective.runId,
+        );
+      },
+      onActivityDeltaEvent: ({ event, input }) => {
+        if (revoked) return;
+        const effective = effectiveInput(input);
+        this.recordActivityEventRun(
+          agent.agentId!,
+          effective.threadId,
+          event.messageId,
+          effective.runId,
+        );
       },
       onToolCallResultEvent: ({ event, input }) => {
         if (revoked) return;
@@ -362,16 +465,31 @@ export class StateManager {
           this.pruneRawEvents(agent.agentId!, agent.threadId, messages);
         }
       },
-    });
+    };
+
+    const { unsubscribe } = agent.subscribe(subscriber);
 
     this.agentSubscriptions.set(agentId, {
       agent,
+      subscriber,
       unsubscribe: () => {
         revoked = true;
         this.pendingContinuations.delete(agent);
         unsubscribe();
       },
     });
+
+    if (replacedInstance) {
+      // The replaced instance's callbacks are revoked, so any run it left open
+      // can never close itself; close them here or a consumer waiting on one
+      // waits forever. Done only now that the new subscription is registered:
+      // a consumer re-reading state from the close notification must already
+      // see the new instance as observed, otherwise it reads "unknown" and
+      // nothing ever corrects that. Provenance (`lastActivityEventRun`) is
+      // deliberately kept: those activities really were produced live, and
+      // with their runs now closed they read as settled, which is truthful.
+      this.closeOpenRunsForAgent(agentId);
+    }
   }
 
   /**
@@ -383,7 +501,11 @@ export class StateManager {
       existing.unsubscribe();
       this.agentSubscriptions.delete(agentId);
     }
+    // Nothing can report these runs' end any more, so close them rather than
+    // leave a consumer waiting on a run that is already gone.
+    this.closeOpenRunsForAgent(agentId);
     this.rawEventByMessage.delete(agentId);
+    this.lastActivityEventRun.delete(agentId);
   }
 
   /**
@@ -410,6 +532,108 @@ export class StateManager {
     messageId: string,
   ): string | undefined {
     return this.messageToRun.get(agentId)?.get(threadId)?.get(messageId);
+  }
+
+  /** True while `runId` is still producing on that agent's thread. */
+  isRunActive(agentId: string, threadId: string, runId: string): boolean {
+    return this.openRuns.get(agentId)?.get(threadId)?.has(runId) ?? false;
+  }
+
+  /**
+   * Whether this manager observes the events of `agent`: true for the instance
+   * it subscribed and for any clone that inherited that subscription, false for
+   * an instance created before it (which can never receive the callbacks).
+   */
+  isAgentInstanceObserved(agentId: string, agent: AbstractAgent): boolean {
+    const existing = this.agentSubscriptions.get(agentId);
+    return !!existing && agent.subscribers.includes(existing.subscriber);
+  }
+
+  /** See {@link ActivityExchangeState}. */
+  getActivityExchangeState(
+    agentId: string,
+    threadId: string,
+    messageId: string,
+    agent: AbstractAgent,
+  ): ActivityExchangeState {
+    if (!this.isAgentInstanceObserved(agentId, agent)) return "unknown";
+    const runId = this.lastActivityEventRun
+      .get(agentId)
+      ?.get(threadId)
+      ?.get(messageId);
+    if (runId === undefined) return "untracked";
+    return this.isRunActive(agentId, threadId, runId) ? "pending" : "settled";
+  }
+
+  /**
+   * Close every run still open for an agent, notifying for each.
+   *
+   * Used when the instance that owned those runs can no longer report their
+   * end (its subscription was replaced or removed), so that nothing is left
+   * waiting on a run that will never close itself.
+   */
+  private closeOpenRunsForAgent(agentId: string): void {
+    const agentRuns = this.openRuns.get(agentId);
+    if (!agentRuns) return;
+    for (const [threadId, runIds] of [...agentRuns]) {
+      for (const runId of [...runIds]) {
+        this.closeEffectiveRun(agentId, threadId, runId);
+      }
+    }
+  }
+
+  private recordActivityEventRun(
+    agentId: string,
+    threadId: string,
+    messageId: string,
+    runId: string,
+  ): void {
+    let agentRuns = this.lastActivityEventRun.get(agentId);
+    if (!agentRuns) {
+      agentRuns = new Map();
+      this.lastActivityEventRun.set(agentId, agentRuns);
+    }
+    let threadRuns = agentRuns.get(threadId);
+    if (!threadRuns) {
+      threadRuns = new Map();
+      agentRuns.set(threadId, threadRuns);
+    }
+    threadRuns.set(messageId, runId);
+  }
+
+  /**
+   * Close `runId` if it is still open, then notify once.
+   *
+   * Idempotent, and scoped to the run it names: a late finalization of an older
+   * run closes only itself and leaves any concurrent run untouched. Called from
+   * every exit path (finished, error, finalized/abort), so whichever arrives
+   * first performs the close and the rest are no-ops.
+   */
+  private closeEffectiveRun(
+    agentId: string,
+    threadId: string,
+    runId: string,
+  ): void {
+    const agentRuns = this.openRuns.get(agentId);
+    const threadRuns = agentRuns?.get(threadId);
+    if (!threadRuns?.delete(runId)) return;
+    if (threadRuns.size === 0) agentRuns!.delete(threadId);
+    if (agentRuns!.size === 0) this.openRuns.delete(agentId);
+    void this._internal.notifySubscribers(
+      (subscriber) =>
+        subscriber.onActivityRunSettled?.({
+          copilotkit: this.core,
+          agentId,
+          threadId,
+          runId,
+        }),
+      "Subscriber onActivityRunSettled error:",
+    );
+  }
+
+  /** Typed access to CopilotKitCore's internal ("friend") methods. */
+  private get _internal(): CopilotKitCoreFriendsAccess {
+    return this.core as unknown as CopilotKitCoreFriendsAccess;
   }
 
   /**
@@ -454,6 +678,17 @@ export class StateManager {
 
     const { threadId, runId } = input;
     this.activeRun.set(`${agent.agentId}:${threadId}`, runId);
+    let agentRuns = this.openRuns.get(agent.agentId);
+    if (!agentRuns) {
+      agentRuns = new Map();
+      this.openRuns.set(agent.agentId, agentRuns);
+    }
+    let threadRuns = agentRuns.get(threadId);
+    if (!threadRuns) {
+      threadRuns = new Set();
+      agentRuns.set(threadId, threadRuns);
+    }
+    threadRuns.add(runId);
     // Only persist state when it carries real data. An empty {} from an
     // initial-state-less run would cause getStateByRun to return {} instead
     // of undefined, breaking renderers that rely on undefined to mean "no
@@ -475,6 +710,10 @@ export class StateManager {
 
     const { threadId, runId } = input;
     this.activeRun.delete(`${agent.agentId}:${threadId}`);
+    // Liveness is closed through closeEffectiveRun so a late terminal event for
+    // an older run cannot clear a newer run's slot, and so the settled
+    // notification fires exactly once across all exit paths.
+    this.closeEffectiveRun(agent.agentId, threadId, runId);
     if (state && Object.keys(state).length > 0) {
       this.saveState(agent.agentId, threadId, runId, state);
     }
@@ -686,6 +925,8 @@ export class StateManager {
     this.stateByRun.delete(agentId);
     this.messageToRun.delete(agentId);
     this.rawEventByMessage.delete(agentId);
+    this.lastActivityEventRun.delete(agentId);
+    this.closeOpenRunsForAgent(agentId);
   }
 
   /**
@@ -695,5 +936,11 @@ export class StateManager {
     this.stateByRun.get(agentId)?.delete(threadId);
     this.messageToRun.get(agentId)?.delete(threadId);
     this.rawEventByMessage.get(agentId)?.delete(threadId);
+    this.lastActivityEventRun.get(agentId)?.delete(threadId);
+    for (const runId of [
+      ...(this.openRuns.get(agentId)?.get(threadId) ?? []),
+    ]) {
+      this.closeEffectiveRun(agentId, threadId, runId);
+    }
   }
 }
