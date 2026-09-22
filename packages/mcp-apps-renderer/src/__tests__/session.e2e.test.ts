@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AbstractAgent } from "@ag-ui/client";
+import { PostMessageTransport } from "@modelcontextprotocol/ext-apps/app-bridge";
 import { bindMcpApp } from "../session";
 import type { McpAppSession } from "../session";
 import type { MCPAppsActivityContent } from "../content-schema";
@@ -11,12 +12,22 @@ function makeAgent(overrides?: Partial<Record<string, unknown>>) {
   const addMessageCalls: Array<{ id: string; role: string; content: string }> =
     [];
   const runAgentCalls: Array<any> = [];
+  let messages: any[] = [];
   const agent = {
     agentId: "test-agent",
     threadId: "thread-1",
     isRunning: false,
     addMessageCalls,
     runAgentCalls,
+    get messages() {
+      return messages;
+    },
+    set messages(v: any[]) {
+      messages = v;
+    },
+    setMessages(v: any[]) {
+      messages = v;
+    },
     addMessage(msg: { id: string; role: string; content: string }) {
       addMessageCalls.push(msg);
     },
@@ -71,6 +82,23 @@ function makeContent(
   } as MCPAppsActivityContent;
 }
 
+/** Captures a callback set asynchronously from a closure, avoiding TS narrowing issues. */
+function callbackHolder(): {
+  fire(): void;
+  capture(cb: () => void): { unsubscribe: ReturnType<typeof vi.fn> };
+} {
+  let fn: (() => void) | undefined;
+  return {
+    fire() {
+      fn?.();
+    },
+    capture(cb: () => void) {
+      fn = cb;
+      return { unsubscribe: vi.fn() };
+    },
+  };
+}
+
 /**
  * A message-store snapshot holding the activity the self-subscription tests bind
  * to (`messageId: "act-1"`).
@@ -80,6 +108,41 @@ const storeWith = (content: unknown) => [
 ];
 
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Hold the send of ONE JSON-RPC response, by id, until released.
+ *
+ * The session binds `rawSend` from the transport prototype when it constructs
+ * the transport, so a spy installed before `bindMcpApp` is what every send goes
+ * through. Only the targeted response is held; everything else (initialize,
+ * sandbox-resource-ready, other responses) passes straight through. This is
+ * what makes "an observation arrives while the response is still going out" a
+ * deterministic state rather than a microtask race.
+ */
+function holdResponseSend(id: string) {
+  let release: (() => void) | undefined;
+  let held = false;
+  const original = PostMessageTransport.prototype.send;
+  vi.spyOn(PostMessageTransport.prototype, "send").mockImplementation(
+    async function (this: PostMessageTransport, message: any, options?: any) {
+      if (message?.id === id && ("result" in message || "error" in message)) {
+        held = true;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return original.call(this, message, options);
+    },
+  );
+  return {
+    get held() {
+      return held;
+    },
+    release() {
+      release?.();
+    },
+  };
+}
 
 /** Dispatch a JSON-RPC message from the iframe (source = its contentWindow). */
 function fromIframe(iframe: HTMLIFrameElement, data: unknown) {
@@ -790,6 +853,599 @@ describe("bindMcpApp self-subscription (messageId)", () => {
     expect(
       captured.filter((m) => m.method === "ui/notifications/tool-result"),
     ).toEqual([]);
+  });
+
+  it("retires a store activity with isError when subscribeRunSettled fires, adds one developer message and one run", async () => {
+    const sub = makeSubscribingAgent();
+    const onRemoved = vi.fn();
+    const hostRunAgent = vi
+      .fn()
+      .mockResolvedValue({ result: undefined, newMessages: [] });
+    const errorContent = makeContent({
+      result: { content: [], isError: true },
+    });
+    const settled = callbackHolder();
+
+    // Mutable ref so getExchangeState can switch mid-test.
+    let exchangeState: "pending" | "settled" = "pending";
+    // The store must hold the activity so removeFromStore can find it.
+    (sub.agent as any).messages = storeWith(errorContent);
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => errorContent,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      getExchangeState: () => exchangeState,
+      subscribeRunSettled: settled.capture,
+      hooks: { onRemoved },
+    });
+    sessions.push(session);
+    await tick(60);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/sandbox-proxy-ready",
+    });
+    await tick(30);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/initialized",
+    });
+    await tick(20);
+
+    // Store holds the error content, observed during pending.
+    sub.emitMessagesChanged(storeWith(errorContent));
+    await tick(20);
+
+    // During pending, the controller keeps the widget (provisional).
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect(hostRunAgent).not.toHaveBeenCalled();
+
+    // Run ends: exchange becomes settled.
+    exchangeState = "settled";
+    settled.fire();
+    // Let the async commitSignal queue drain.
+    await tick(100);
+
+    // The widget was retired.
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    // The activity was removed from the store.
+    expect((sub.agent as any).messages).toEqual([]);
+    // Exactly one developer message was added to explain the failure.
+    const added = (sub.agent as any).addMessageCalls as Array<{ role: string }>;
+    expect(added).toHaveLength(1);
+    expect(added[0].role).toBe("developer");
+    // Exactly one follow-up run was triggered.
+    expect(hostRunAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires a store activity with invalid content when the run settles, adds one developer message", async () => {
+    const sub = makeSubscribingAgent();
+    const onRemoved = vi.fn();
+    const onContentError = vi.fn();
+    const hostRunAgent = vi
+      .fn()
+      .mockResolvedValue({ result: undefined, newMessages: [] });
+    // Content that fails the schema: no serverHash.
+    const badContent = {
+      resourceUri: "ui://test/app",
+      result: { content: [] },
+    };
+    const settled = callbackHolder();
+
+    let exchangeState: "pending" | "settled" = "pending";
+    // Store must hold the activity.
+    (sub.agent as any).messages = [
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: badContent,
+      },
+    ];
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => badContent as any,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      getExchangeState: () => exchangeState,
+      subscribeRunSettled: settled.capture,
+      hooks: { onRemoved, onContentError },
+    });
+    sessions.push(session);
+    await tick(60);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/sandbox-proxy-ready",
+    });
+    await tick(30);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/initialized",
+    });
+    await tick(20);
+
+    // Store holds the bad content, observed during pending.
+    sub.emitMessagesChanged([
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: badContent,
+      },
+    ]);
+    await tick(20);
+
+    // During pending, the controller keeps the widget. The content error is reported.
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect(onContentError).toHaveBeenCalled();
+
+    // Run settles.
+    exchangeState = "settled";
+    settled.fire();
+    await tick(100);
+
+    // Now the controller sees settled + invalid and removes.
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    // The activity was removed from the store.
+    expect((sub.agent as any).messages).toEqual([]);
+    // One developer message explaining the failure.
+    const added = (sub.agent as any).addMessageCalls as Array<{ role: string }>;
+    expect(added).toHaveLength(1);
+    expect(added[0].role).toBe("developer");
+    // One follow-up run.
+    expect(hostRunAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("unsubscribes from subscribeRunSettled on teardown", async () => {
+    const sub = makeSubscribingAgent();
+    const unsubRunSettled = vi.fn();
+    const subscribeRunSettled = () => ({ unsubscribe: unsubRunSettled });
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => makeContent(),
+      getAgent: () => sub.agent,
+      host: { runAgent: async () => ({ result: undefined, newMessages: [] }) },
+      messageId: "act-1",
+      getExchangeState: () => "pending",
+      subscribeRunSettled,
+      hooks: {},
+    });
+    sessions.push(session);
+    await tick(60);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/sandbox-proxy-ready",
+    });
+    await tick(30);
+
+    session.teardown();
+    expect(unsubRunSettled).toHaveBeenCalled();
+  });
+
+  it("re-evaluates an external activity (no messageId) when subscribeRunSettled fires", async () => {
+    const agent = makeAgent();
+    const onRemoved = vi.fn();
+    const errorContent = makeContent({
+      result: { content: [], isError: true },
+    });
+    const settled = callbackHolder();
+
+    let exchangeState: "pending" | "settled" = "pending";
+    const iframe = mount();
+    // No messageId: this is an external activity.
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => errorContent,
+      getAgent: () => agent,
+      host: { runAgent: async () => ({ result: undefined, newMessages: [] }) },
+      externalActivityKey: "ext-1",
+      getExchangeState: () => exchangeState,
+      subscribeRunSettled: settled.capture,
+      hooks: { onRemoved },
+    });
+    sessions.push(session);
+    await tick(60);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/sandbox-proxy-ready",
+    });
+    await tick(30);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/initialized",
+    });
+    await tick(20);
+
+    // Seed the error content via syncContent during pending.
+    session.syncContent(errorContent);
+    await tick(20);
+    expect(onRemoved).not.toHaveBeenCalled();
+
+    // Run settles.
+    exchangeState = "settled";
+    settled.fire();
+    await tick(20);
+
+    // The controller now sees settled + isError and retires.
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A bound, connected widget whose next tools/call returns a tool error, so
+   * the proxy path retires it - with the send of that response held.
+   */
+  async function bootWithHeldProxyFailure(hooks: {
+    onRemoved: ReturnType<typeof vi.fn>;
+  }) {
+    const sub = makeSubscribingAgent();
+    const hostRunAgent = vi
+      .fn()
+      .mockResolvedValue({ result: undefined, newMessages: [] });
+    const runAgent = vi.fn(async (input?: any) => {
+      const req = input?.forwardedProps?.__proxiedMCPRequest;
+      if (req?.method === "resources/read") {
+        return {
+          result: {
+            contents: [
+              { uri: req.params?.uri, mimeType: "text/html", text: "<p/>" },
+            ],
+          },
+          newMessages: [],
+        };
+      }
+      if (req?.method === "tools/call") {
+        return {
+          result: { content: [{ type: "text", text: "boom" }], isError: true },
+          newMessages: [],
+        };
+      }
+      return { result: {}, newMessages: [] };
+    });
+    (sub.agent as any).runAgent = runAgent;
+    const content = makeContent();
+    (sub.agent as any).messages = storeWith(content);
+    const settled = callbackHolder();
+    const hold = holdResponseSend("call-err");
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => content,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      getExchangeState: () => "settled",
+      subscribeRunSettled: settled.capture,
+      hooks,
+    });
+    sessions.push(session);
+    await tick(60);
+    const captured = captureOutgoing(iframe);
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      method: "ui/notifications/sandbox-proxy-ready",
+    });
+    await tick(30);
+
+    fromIframe(iframe, {
+      jsonrpc: "2.0",
+      id: "call-err",
+      method: "tools/call",
+      params: { name: "book", arguments: {} },
+    });
+    await vi.waitFor(() => expect(hold.held).toBe(true));
+
+    return {
+      sub,
+      session,
+      iframe,
+      captured,
+      hold,
+      hostRunAgent,
+      runAgent,
+      settled,
+      content,
+    };
+  }
+
+  it("holds off every concurrent observation while a proxy response is still going out, then concludes once", async () => {
+    const onRemoved = vi.fn();
+    const { sub, session, captured, hold, hostRunAgent, settled } =
+      await bootWithHeldProxyFailure({ onRemoved });
+    const failed = makeContent({ result: { content: [], isError: true } });
+
+    // Everything that could otherwise retire the widget, while the answer to
+    // its own request has not left yet: a store update, a run settling, and
+    // the adapter's prop seed.
+    sub.emitMessagesChanged(storeWith(failed));
+    settled.fire();
+    session.syncContent(failed);
+    await tick(20);
+
+    // None of it may conclude the retirement or report ahead of the send.
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect((sub.agent as any).addMessageCalls).toHaveLength(0);
+    expect(hostRunAgent).not.toHaveBeenCalled();
+    expect(captured.find((m) => m?.id === "call-err")).toBeUndefined();
+
+    hold.release();
+    await tick(80);
+
+    // The response went out first; then exactly one removal and one report.
+    expect(captured.find((m) => m?.id === "call-err")?.result).toMatchObject({
+      isError: true,
+    });
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect((sub.agent as any).addMessageCalls).toHaveLength(1);
+    expect(hostRunAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("concludes a pending proxy retirement as a cancellation when torn down mid-send, so a remount stays removed", async () => {
+    const onRemoved = vi.fn();
+    const { sub, session, hold, hostRunAgent, runAgent, content } =
+      await bootWithHeldProxyFailure({ onRemoved });
+    const readsBefore = runAgent.mock.calls.filter(
+      (c: any[]) =>
+        c[0]?.forwardedProps?.__proxiedMCPRequest?.method === "resources/read",
+    ).length;
+
+    // The host tears the widget down while its answer is still on its way out.
+    session.teardown();
+
+    // Remount in the same turn, before the bridge's asynchronous cancellation
+    // handlers run. A delay here would hide a session stuck at `retiring`.
+    // A cancellation: nothing was delivered, so nothing is explained, and a
+    // torn-down adapter is not told about a removal.
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect((sub.agent as any).addMessageCalls).toHaveLength(0);
+    expect(hostRunAgent).not.toHaveBeenCalled();
+
+    // The same widget mounts again. The retirement must have concluded rather
+    // than stuck at `retiring`: the new session finds it removed and takes the
+    // widget off screen, without fetching and without a second report.
+    const onRemovedAgain = vi.fn();
+    const again = bindMcpApp({
+      iframe: mount(),
+      getContent: () => content,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      getExchangeState: () => "settled",
+      hooks: { onRemoved: onRemovedAgain },
+    });
+    sessions.push(again);
+    await tick(40);
+
+    expect(onRemovedAgain).toHaveBeenCalledTimes(1);
+    expect((sub.agent as any).addMessageCalls).toHaveLength(0);
+    expect(
+      runAgent.mock.calls.filter(
+        (c: any[]) =>
+          c[0]?.forwardedProps?.__proxiedMCPRequest?.method ===
+          "resources/read",
+      ),
+    ).toHaveLength(readsBefore);
+
+    hold.release();
+  });
+
+  it("still retires and explains when the resource fetch failed and no widget ever mounted", async () => {
+    const sub = makeSubscribingAgent();
+    const onRemoved = vi.fn();
+    const onError = vi.fn();
+    const hostRunAgent = vi
+      .fn()
+      .mockResolvedValue({ result: undefined, newMessages: [] });
+    // The failure this test is about: the resource can never be fetched, so
+    // setup() throws before it would have reached the end of its body.
+    (sub.agent as any).runAgent = async (input?: any) => {
+      if (
+        input?.forwardedProps?.__proxiedMCPRequest?.method === "resources/read"
+      ) {
+        throw new Error("resources/read failed: no server hash");
+      }
+      return { result: {}, newMessages: [] };
+    };
+
+    const errorContent = makeContent({
+      result: { content: [], isError: true },
+    });
+    const settled = callbackHolder();
+    let exchangeState: "pending" | "settled" = "pending";
+    (sub.agent as any).messages = [
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: errorContent,
+      },
+    ];
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => errorContent,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      getExchangeState: () => exchangeState,
+      subscribeRunSettled: settled.capture,
+      hooks: { onRemoved, onError },
+    });
+    sessions.push(session);
+    // No sandbox handshake: the fetch failed, so the iframe never loads.
+    await tick(60);
+    expect(onError).toHaveBeenCalled();
+    expect(onRemoved).not.toHaveBeenCalled();
+
+    // The run ends. The subscription must exist despite the failed setup.
+    exchangeState = "settled";
+    settled.fire();
+    await tick(100);
+
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect((sub.agent as any).messages).toEqual([]);
+    const added = (sub.agent as any).addMessageCalls as Array<{ role: string }>;
+    expect(added).toHaveLength(1);
+    expect(added[0].role).toBe("developer");
+    expect(hostRunAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("explains an activity already terminal at bind time, with no later event at all", async () => {
+    const sub = makeSubscribingAgent();
+    const onRemoved = vi.fn();
+    const hostRunAgent = vi
+      .fn()
+      .mockResolvedValue({ result: undefined, newMessages: [] });
+    // The fetch fails, so the widget never mounts and never initializes.
+    (sub.agent as any).runAgent = async () => {
+      throw new Error("resources/read failed: no server hash");
+    };
+
+    const errorContent = makeContent({
+      result: { content: [], isError: true },
+    });
+    (sub.agent as any).messages = [
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: errorContent,
+      },
+    ];
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => errorContent,
+      getAgent: () => sub.agent,
+      host: { runAgent: hostRunAgent },
+      messageId: "act-1",
+      // The run had ALREADY finished when this session was bound: a history
+      // reload, or a component mounting after the run ended.
+      getExchangeState: () => "settled",
+      // Deliberately no subscribeRunSettled: nothing will ever notify us.
+      hooks: { onRemoved },
+    });
+    sessions.push(session);
+
+    // No sandbox handshake, no messages change, no run-settled notification.
+    await tick(80);
+
+    // The bind-time observation alone must have produced the full signal.
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect((sub.agent as any).messages).toEqual([]);
+    const added = (sub.agent as any).addMessageCalls as Array<{ role: string }>;
+    expect(added).toHaveLength(1);
+    expect(added[0].role).toBe("developer");
+    expect(hostRunAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports onRemoved once even when the adapter's syncContent seed follows a bind-time retirement", async () => {
+    const sub = makeSubscribingAgent();
+    const onRemoved = vi.fn();
+    (sub.agent as any).runAgent = async () => ({ result: {}, newMessages: [] });
+    const errorContent = makeContent({
+      result: { content: [], isError: true },
+    });
+    (sub.agent as any).messages = [
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: errorContent,
+      },
+    ];
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => errorContent,
+      getAgent: () => sub.agent,
+      host: { runAgent: async () => ({ result: undefined, newMessages: [] }) },
+      messageId: "act-1",
+      getExchangeState: () => "settled",
+      hooks: { onRemoved },
+    });
+    sessions.push(session);
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+
+    // Every adapter seeds the prop content right after binding.
+    session.syncContent(errorContent);
+    await tick(20);
+
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fetch a resource the controller refused to mount", async () => {
+    const sub = makeSubscribingAgent();
+    const runAgent = vi.fn(async () => ({ result: {}, newMessages: [] }));
+    (sub.agent as any).runAgent = runAgent;
+
+    // Identity is incomplete (no serverHash): there is nothing to fetch, and
+    // the controller keeps the widget in `waiting` rather than mounting it.
+    const incomplete = {
+      resourceUri: "ui://test/app",
+      result: { content: [] },
+    };
+    (sub.agent as any).messages = [
+      {
+        id: "act-1",
+        role: "activity",
+        activityType: "mcp-apps",
+        content: incomplete,
+      },
+    ];
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => incomplete as any,
+      getAgent: () => sub.agent,
+      host: { runAgent: async () => ({ result: undefined, newMessages: [] }) },
+      messageId: "act-1",
+      getExchangeState: () => "pending",
+      hooks: {},
+    });
+    sessions.push(session);
+    await tick(80);
+
+    expect(
+      runAgent.mock.calls.filter(
+        (c: any[]) =>
+          c[0]?.forwardedProps?.__proxiedMCPRequest?.method ===
+          "resources/read",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("subscribes to the message store even when the resource fetch failed", async () => {
+    const sub = makeSubscribingAgent();
+    (sub.agent as any).runAgent = async () => {
+      throw new Error("resources/read failed");
+    };
+
+    const iframe = mount();
+    const session = bindMcpApp({
+      iframe,
+      getContent: () => makeContent(),
+      getAgent: () => sub.agent,
+      host: { runAgent: async () => ({ result: undefined, newMessages: [] }) },
+      messageId: "act-1",
+      hooks: {},
+    });
+    sessions.push(session);
+    await tick(60);
+
+    expect(sub.hasSubscriber).toBe(true);
   });
 });
 

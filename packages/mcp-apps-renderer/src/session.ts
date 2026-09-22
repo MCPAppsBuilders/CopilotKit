@@ -18,6 +18,7 @@ import type { ɵMcpFollowUpHost } from "./follow-up";
 import {
   MCP_OPEN_LINK_BLOCKED_SCHEMES,
   MCPAppsActivityType,
+  ɵmcpAppsIdentityKey as identityKeyOf,
 } from "./constants";
 import { MCPAppsActivityContentSchema } from "./content-schema";
 import type { MCPAppsActivityContent } from "./content-schema";
@@ -97,29 +98,6 @@ function selectResource(
   const match = contents?.find((candidate) => candidate.uri === resourceUri);
   if (match) return match;
   return !requireExact && contents?.length === 1 ? contents[0] : undefined;
-}
-
-/**
- * Stable key for the widget resource a session is bound to. A session fetches
- * and renders exactly ONE resource. If the store activity for this messageId is
- * later replaced by a different resource (resourceUri/serverHash/serverId), the
- * store subscription must NOT push the new widget's tool input/result into this
- * (old) iframe - the adapter re-binds a fresh session for the new identity.
- */
-function identityKeyOf(content: {
-  resourceUri?: string;
-  serverHash?: string;
-  serverId?: string;
-}): string {
-  // Serialised as a tuple rather than joined with a delimiter: a resourceUri is
-  // arbitrary text, so any separator can appear inside it and make two distinct
-  // widgets share a key (`"a::b" + "c"` vs `"a" + "b::c"`). JSON also keeps
-  // `undefined` distinct from `""` instead of collapsing both to empty.
-  return JSON.stringify([
-    content.resourceUri ?? null,
-    content.serverHash ?? null,
-    content.serverId ?? null,
-  ]);
 }
 
 /**
@@ -286,6 +264,19 @@ export interface BindMcpAppOptions {
   externalActivityKey?: string;
   /** Release already-started proxy/follow-up waits on teardown, without aborting the underlying run. */
   cancelRunningWaitOnTeardown?: boolean;
+  /**
+   * Subscribe to run-settled notifications from the core. The session calls
+   * this at setup and unsubscribes on teardown. When a run ends with no
+   * further content change, the callback re-reads the current content and
+   * feeds the controller a fresh observation at the now-settled exchange
+   * state, which is the only way it can retire a widget whose last content
+   * update arrived during `"pending"`.
+   *
+   * Supplied by the adapter because the notification lives in
+   * `@copilotkit/core` (see `copilotkit.subscribe({ onActivityRunSettled })`),
+   * which this package does not depend on.
+   */
+  subscribeRunSettled?: (callback: () => void) => { unsubscribe(): void };
 }
 
 /** Host identity announced during the initialization handshake. */
@@ -456,6 +447,7 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
   // single error state, whether the content came from the store or from a prop.
   let lastInvalidContentKey: string | undefined;
   let activitySub: { unsubscribe(): void } | null = null;
+  let runSettledSub: { unsubscribe(): void } | null = null;
   // Sandbox handshake watchdog (see initializationTimeoutMs).
   let sandboxTimer: ReturnType<typeof setTimeout> | undefined;
   let sandboxReady = false;
@@ -475,7 +467,10 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
           isExternal: messageId === undefined,
         })
       : undefined;
-  const generation = controller?.rebind() ?? 0;
+  // Acquired by identity, not blindly: a remount of the SAME widget must find
+  // its previous verdict (a removed widget stays removed, an owed report stays
+  // owed), while a different resource for this activity starts a fresh cycle.
+  const generation = controller?.acquire(boundIdentity) ?? 0;
   const capturedThreadId = boundAgent?.threadId || "default";
 
   /**
@@ -501,6 +496,56 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
     controller?.finalizeRemoval(generation);
     hooks?.onRemoved?.(reason);
     closeSession();
+  };
+
+  /**
+   * Run the failure controller over one content value and carry out a terminal
+   * verdict: report the failure to the agent if this generation still holds the
+   * reservation, then take the widget down.
+   *
+   * Returns true when the widget is going away, so every caller stops there -
+   * forwarding content to a widget being retired is pointless, and reporting a
+   * recoverable rejection on top of a terminal one would contradict it.
+   * Always false when there is no controller, which keeps the
+   * validation-only path behaving exactly as it did before.
+   */
+  const observeForController = (content: unknown): boolean => {
+    // Already gone: the adapter's `syncContent` seed can still arrive after a
+    // bind-time retirement closed this session, and must not retire it twice.
+    if (disposed) return true;
+    if (!controller) return false;
+    const phase = controller.observe(generation, {
+      origin: "activity",
+      content,
+      exchange: opts.getExchangeState?.() ?? "unknown",
+      identityAvailable: identityIsUsable(content),
+    });
+    // `retiring` belongs to a proxy response still on its way out: the widget
+    // is going, so callers stop forwarding to it, but nothing here may report
+    // or close the session. That would race the answer the widget is waiting
+    // for, which is exactly what the transport barrier exists to prevent. The
+    // proxy path concludes its own retirement once the send has settled.
+    if (phase === "retiring") return true;
+    if (phase !== "removed") return false;
+
+    const reason = controller.reason ?? reasonFromToolError("activity");
+    if (controller.signal === "reserved") {
+      const agentNow = getAgent();
+      if ((agentNow?.threadId || "default") === capturedThreadId) {
+        void controller
+          .commitSignal(generation, host, removeFromStore)
+          .catch((error: unknown) => {
+            console.error(
+              "[MCPAppsRenderer] activity failure report failed:",
+              error,
+            );
+          });
+      } else {
+        controller.abandonSignal(generation);
+      }
+    }
+    retireWidget(reason);
+    return true;
   };
 
   /**
@@ -593,34 +638,7 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
     // The controller decides whether this content is terminal. It runs before
     // the recoverable-content path below, because a terminal verdict retires
     // the widget rather than leaving an error on a widget that stays.
-    if (controller) {
-      const phase = controller.observe(generation, {
-        origin: "activity",
-        content,
-        exchange: opts.getExchangeState?.() ?? "unknown",
-        identityAvailable: identityIsUsable(content),
-      });
-      if (phase === "removed" || phase === "retiring") {
-        const reason = reasonFromToolError("activity");
-        if (controller.signal === "reserved") {
-          const agentNow = getAgent();
-          if ((agentNow?.threadId || "default") === capturedThreadId) {
-            void controller
-              .commitSignal(generation, host, removeFromStore)
-              .catch((error: unknown) => {
-                console.error(
-                  "[MCPAppsRenderer] activity failure report failed:",
-                  error,
-                );
-              });
-          } else {
-            controller.abandonSignal(generation);
-          }
-        }
-        retireWidget(reason);
-        return;
-      }
-    }
+    if (observeForController(content)) return;
 
     const parsedContent = MCPAppsActivityContentSchema.safeParse(content);
     if (!parsedContent.success) {
@@ -667,16 +685,24 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
       | undefined;
     const msg = list?.find((m) => m?.id === messageId);
     if (!msg || msg.activityType !== MCPAppsActivityType) return;
+
+    // The controller must see EVERY content update, including ones the schema
+    // rejects: a terminal verdict on invalid content retires the widget rather
+    // than leaving it stuck with an error banner and no way to recover.
+    // pushFromContent already runs the controller for valid content; this
+    // covers the invalid path that pushFromContent never reaches.
     const parsed = MCPAppsActivityContentSchema.safeParse(msg.content);
     if (!parsed.success) {
-      // Rejected content is NOT forwarded, but the failure must be observable
-      // rather than a silent no-op: otherwise the widget simply never receives
-      // its result and nothing says why.
+      if (observeForController(msg.content)) return;
+      // The widget stays (e.g. the exchange is still pending): report the
+      // rejection so the adapter can show a recoverable error banner.
       reportContentRejected(msg.content, parsed.error);
       return;
     }
-    // pushFromContent clears the rejection once it has validated the result.
-    pushFromContent(parsed.data);
+
+    // pushFromContent handles its own controller observation for valid content,
+    // clears any previous rejection, and forwards tool input/result.
+    pushFromContent(msg.content as MCPAppsActivityContent);
   };
 
   /** True when this activity currently lives in the agent's message store. */
@@ -742,6 +768,15 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
   const closeSession = () => {
     if (disposed) return;
     disposed = true;
+    // A replacement session may bind in this same turn, before bridge.close()
+    // settles the response barrier. Publish the cancellation now so it sees
+    // `removed`, not an orphaned `retiring` state with no notification to follow.
+    // Only cancel a proxy response owned by this session; a report already
+    // committed after a successful send must survive teardown.
+    if (pendingSends.size > 0 && controller?.phase === "retiring") {
+      controller.abandonSignal(generation);
+      controller.finalizeRemoval(generation);
+    }
     if (sandboxTimer !== undefined) {
       clearTimeout(sandboxTimer);
       sandboxTimer = undefined;
@@ -750,10 +785,17 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
     // an iframe that is going away. Requests already in flight keep running
     // (runAgent has no abort), and other widgets' queued work is untouched.
     mcpAppsRequestQueue.cancelOwner(queueOwner);
+    runSettledSub?.unsubscribe();
+    runSettledSub = null;
     activitySub?.unsubscribe();
     activitySub = null;
     const b = bridge;
     bridge = null;
+    // Closing the bridge also settles any proxy response still on its way out:
+    // the SDK aborts every in-flight request handler on close, and a handler
+    // stays in flight until its response has been sent, so the barrier's
+    // `extra.signal` fires and releases the response waiter. Its finalization
+    // is idempotent with the synchronous cancellation above.
     void b?.close();
   };
 
@@ -1059,7 +1101,14 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
             controller?.abandonSignal(generation);
           } finally {
             if (requestId !== undefined) pendingSends.delete(requestId);
-            retireWidget(reason);
+            if (disposed) {
+              // Torn down while the answer was pending: there is no adapter
+              // left to tell, but the retirement this response started must
+              // still conclude, or the exchange stays `retiring` for good.
+              controller?.finalizeRemoval(generation);
+            } else {
+              retireWidget(reason);
+            }
           }
         })();
 
@@ -1130,24 +1179,6 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
         bridge = null;
         return;
       }
-
-      // Self-driving: subscribe to the agent and push tool input/result for THIS
-      // activity to the widget, so the framework adapter does not forward them.
-      //
-      // We read from `onMessagesChanged`, NOT `onActivitySnapshotEvent` /
-      // `onActivityDeltaEvent`: those fire with the PRE-update `activityMessage`
-      // (the snapshot's new content / the delta patch is applied only after the
-      // callback returns), so reading them yields stale content and the dedup
-      // below can suppress the send entirely. `onMessagesChanged` fires AFTER the
-      // store is updated, so `messages` holds the applied content - and it also
-      // covers full messages-snapshot updates, which the activity callbacks miss.
-      if (messageId) {
-        activitySub =
-          getAgent()?.subscribe({
-            onMessagesChanged: ({ messages }) =>
-              pushFromMessages(messages as readonly ActivityLike[]),
-          }) ?? null;
-      }
     } catch (err) {
       console.error("[MCPAppsRenderer] Setup error:", err);
       if (!disposed) {
@@ -1156,7 +1187,85 @@ export function bindMcpApp(opts: BindMcpAppOptions): McpAppSession {
     }
   };
 
-  void setup();
+  // Installed BEFORE `setup()`, and deliberately outside it: these two
+  // subscriptions observe the conversation, not the widget. A session whose
+  // `fetchResource()` fails (missing serverHash, unreachable server) still has
+  // an activity in the store that the controller must be able to retire and
+  // explain - wiring them inside `setup()` would skip that entirely on the very
+  // failures the lifecycle exists to report. Anything they forward before the
+  // bridge exists is buffered by `flushPending`, which no-ops until the widget
+  // is ready.
+
+  // Self-driving: subscribe to the agent and push tool input/result for THIS
+  // activity to the widget, so the framework adapter does not forward them.
+  //
+  // We read from `onMessagesChanged`, NOT `onActivitySnapshotEvent` /
+  // `onActivityDeltaEvent`: those fire with the PRE-update `activityMessage`
+  // (the snapshot's new content / the delta patch is applied only after the
+  // callback returns), so reading them yields stale content and the dedup
+  // can suppress the send entirely. `onMessagesChanged` fires AFTER the store
+  // is updated, so `messages` holds the applied content - and it also covers
+  // full messages-snapshot updates, which the activity callbacks miss.
+  if (messageId) {
+    activitySub =
+      getAgent()?.subscribe({
+        onMessagesChanged: ({ messages }) =>
+          pushFromMessages(messages as readonly ActivityLike[]),
+      }) ?? null;
+  }
+
+  /**
+   * The content this activity currently has. The store wins when it holds the
+   * activity (it carries the applied content); otherwise the adapter's prop is
+   * all there is (an external activity, with or without a messageId).
+   */
+  const currentSourceContent = (): unknown => {
+    if (messageId && activityInStore()) {
+      return (
+        getAgent()?.messages as readonly ActivityLike[] | undefined
+      )?.find((m) => m?.id === messageId)?.content;
+    }
+    return getContent();
+  };
+
+  /** Re-read the current source and run the full push pipeline over it. */
+  const observeCurrentSource = () => {
+    if (disposed) return;
+    if (messageId && activityInStore()) {
+      pushFromMessages();
+    } else {
+      pushFromContent(getContent());
+    }
+  };
+
+  // A run ending with no further content change leaves the controller stuck on
+  // a provisional observation. Re-read the current content at the now-settled
+  // exchange state so the controller can act on it. Applies to both
+  // store-backed (messageId) and external activities.
+  if (opts.subscribeRunSettled && controller) {
+    runSettledSub = opts.subscribeRunSettled(observeCurrentSource);
+  }
+
+  // Observe what is ALREADY there, before anything is loaded. Subscribing only
+  // covers runs that settle from here on: an activity that is terminal at bind
+  // time (history reload, a run that finished before this component mounted)
+  // emits no further event, and if `fetchResource()` then fails the widget
+  // never initializes either. Without this first look the controller would
+  // never reach a verdict, and a dead activity would sit in the chat with no
+  // widget and no explanation.
+  //
+  // Only the controller runs here, deliberately: forwarding is the widget's
+  // business and stays driven by the store subscription and `syncContent`, so
+  // a bind observation never seeds the widget with content it was not sent.
+  if (controller) observeForController(currentSourceContent());
+
+  // Load only what the controller agreed to mount. The observation above may
+  // already have retired this generation - which closes the session - and an
+  // activity whose identity is still incomplete has nothing to fetch yet; the
+  // adapter re-binds once `resourceUri`/`serverHash` arrive.
+  if (!disposed && (!controller || controller.phase === "active")) {
+    void setup();
+  }
 
   return {
     sendToolInput(args) {

@@ -132,7 +132,7 @@ describe("widget controller phases", () => {
       threadId: "thread-1",
       activityKey: "act-1",
     });
-    generation = controller.rebind();
+    generation = controller.acquire("widget-a");
   });
 
   it("stays waiting while the identity needed to mount is missing", () => {
@@ -172,13 +172,14 @@ describe("widget controller phases", () => {
     expect(controller.signal).toBe("reserved");
   });
 
-  it("removes a settled activity whose tool errored, without reserving anything", () => {
-    // The model already saw this failure in its own run; repeating it would
-    // only buy a redundant turn.
+  it("removes a settled activity whose tool errored AND reserves a report", () => {
+    // Driving the real demo showed the model seeing a tool error and saying
+    // nothing, leaving the user with a widget that vanished and no reason. The
+    // user has to be told, even at the cost of a possibly redundant sentence.
     expect(
       controller.observe(generation, activity(toolErrorContent, "settled")),
     ).toBe("removed");
-    expect(controller.signal).toBeUndefined();
+    expect(controller.signal).toBe("reserved");
   });
 
   it("removes an untracked invalid activity visually but never reports it", () => {
@@ -221,7 +222,7 @@ describe("widget controller phases", () => {
 
   it("ignores observations quoting a stale generation", () => {
     controller.observe(generation, activity(validContent, "pending"));
-    const next = controller.rebind();
+    const next = controller.acquire("widget-b");
     expect(next).not.toBe(generation);
 
     expect(
@@ -230,23 +231,104 @@ describe("widget controller phases", () => {
     expect(controller.signal).toBeUndefined();
   });
 
-  it("starts a fresh exchange after rebind, leaving a removed widget behind", () => {
+  it("starts a fresh exchange for a new identity, leaving the removed widget behind", () => {
     controller.observe(generation, activity(invalidContent, "settled"));
     expect(controller.phase).toBe("removed");
 
-    const next = controller.rebind();
+    const next = controller.acquire("widget-b");
     expect(controller.phase).toBe("waiting");
     expect(controller.observe(next, activity(validContent, "pending"))).toBe(
       "active",
     );
   });
 
-  it("releases a reservation the outgoing generation never committed", () => {
+  it("releases a reservation the outgoing exchange never committed when a new identity takes over", () => {
     controller.observe(generation, activity(invalidContent, "settled"));
     expect(controller.signal).toBe("reserved");
 
-    controller.rebind();
+    controller.acquire("widget-b");
     expect(controller.signal).toBeUndefined();
+  });
+
+  it("keeps a removed widget removed when the same exchange is acquired again (remount)", () => {
+    controller.observe(generation, activity(invalidContent, "settled"));
+    expect(controller.phase).toBe("removed");
+    expect(controller.signal).toBe("reserved");
+
+    // The adapter re-rendered the same activity with the same resource. That
+    // is a remount, not a new exchange: nothing about the verdict changes.
+    const remounted = controller.acquire("widget-a");
+    expect(remounted).not.toBe(generation);
+    expect(controller.phase).toBe("removed");
+    expect(controller.signal).toBe("reserved");
+    expect(controller.reason).toBeDefined();
+
+    // A late valid observation from the remounted session changes nothing.
+    expect(
+      controller.observe(remounted, activity(validContent, "settled")),
+    ).toBe("removed");
+  });
+
+  it("keeps an untracked removal across a remount, so reloaded history stays clean", () => {
+    controller.observe(generation, activity(invalidContent, "untracked"));
+    expect(controller.phase).toBe("removed");
+
+    const remounted = controller.acquire("widget-a");
+    expect(controller.phase).toBe("removed");
+    expect(
+      controller.observe(remounted, activity(validContent, "pending")),
+    ).toBe("removed");
+  });
+
+  it("keeps a proxy retirement across a remount, so an external widget cannot reappear", () => {
+    controller.observe(generation, proxy({ content: [], isError: true }));
+    controller.finalizeRemoval(generation);
+    expect(controller.phase).toBe("removed");
+
+    // An unchanged external prop re-renders the same widget.
+    const remounted = controller.acquire("widget-a");
+    expect(controller.phase).toBe("removed");
+    expect(
+      controller.observe(remounted, activity(validContent, "settled")),
+    ).toBe("removed");
+  });
+
+  it("lets the generation that started a proxy retirement conclude it after a same-exchange remount", () => {
+    controller.observe(generation, proxy({ content: [], isError: true }));
+    expect(controller.phase).toBe("retiring");
+    expect(controller.signal).toBe("reserved");
+
+    // The response is still on its way out when the same widget remounts.
+    controller.acquire("widget-a");
+    expect(controller.phase).toBe("retiring");
+
+    // The response's own path, quoting the generation it started under, is
+    // still the one that concludes: it may release the reservation it made...
+    controller.abandonSignal(generation);
+    expect(controller.signal).toBeUndefined();
+    // ...and finish the retirement.
+    controller.finalizeRemoval(generation);
+    expect(controller.phase).toBe("removed");
+  });
+
+  it("does not let a superseded proxy retirement conclude a new exchange's own", () => {
+    controller.observe(generation, proxy({ content: [], isError: true }));
+    expect(controller.phase).toBe("retiring");
+
+    // A different resource takes over, and its own proxy call also retires.
+    const next = controller.acquire("widget-b");
+    expect(controller.phase).toBe("waiting");
+    controller.observe(next, proxy({ content: [], isError: true }));
+    expect(controller.phase).toBe("retiring");
+
+    // The old exchange's response finally settling must not touch it.
+    controller.finalizeRemoval(generation);
+    expect(controller.phase).toBe("retiring");
+    controller.abandonSignal(generation);
+    expect(controller.signal).toBe("reserved");
+
+    controller.finalizeRemoval(next);
+    expect(controller.phase).toBe("removed");
   });
 
   it("finalizeRemoval is idempotent and ignores a stale generation", () => {
@@ -255,7 +337,7 @@ describe("widget controller phases", () => {
     controller.finalizeRemoval(generation);
     expect(controller.phase).toBe("removed");
 
-    const next = controller.rebind();
+    const next = controller.acquire("widget-b");
     controller.observe(next, proxy({ content: [], isError: true }));
     controller.finalizeRemoval(generation); // stale
     expect(controller.phase).toBe("retiring");
@@ -275,7 +357,7 @@ describe("widget controller signalling", () => {
       threadId: "thread-1",
       activityKey: "act-1",
     });
-    generation = controller.rebind();
+    generation = controller.acquire("widget-a");
     controller.observe(generation, activity(invalidContent, "settled"));
   });
 
@@ -375,7 +457,7 @@ describe("widget controller signalling", () => {
     expect(controller.signal).toBe("explained");
   });
 
-  it("does not mutate the conversation when a rebind supersedes work waiting in the queue", async () => {
+  it("does not mutate the conversation when a new exchange supersedes work waiting in the queue", async () => {
     const host = hostThat();
     const removeFromStore = vi.fn();
 
@@ -384,7 +466,7 @@ describe("widget controller signalling", () => {
     await settle();
 
     // A new exchange starts while the commit is still queued.
-    controller.rebind();
+    controller.acquire("widget-b");
 
     agent.releaseQueue();
     await commit;
@@ -395,7 +477,7 @@ describe("widget controller signalling", () => {
     expect(host.calls).toBe(0);
   });
 
-  it("does not write the outcome of a run a rebind superseded while it was in flight", async () => {
+  it("does not write the outcome of a run a new exchange superseded while it was in flight", async () => {
     let release: (() => void) | undefined;
     const slow = hostThat(
       () =>
@@ -411,7 +493,7 @@ describe("widget controller signalling", () => {
     expect(agent.messages).toHaveLength(1);
 
     // The exchange is replaced while the explanation run is still going.
-    const next = controller.rebind();
+    const next = controller.acquire("widget-b");
     release?.();
     await commit;
     await settle();
@@ -422,6 +504,80 @@ describe("widget controller signalling", () => {
     // And the new generation is free to reserve and commit on its own.
     controller.observe(next, activity(invalidContent, "settled"));
     expect(controller.signal).toBe("reserved");
+  });
+
+  it("lets a remounted session commit a report the unmounted one reserved but never committed", async () => {
+    // beforeEach reserved on `generation`; that component unmounts before it
+    // ever commits. The same widget mounts again.
+    const remounted = controller.acquire("widget-a");
+    expect(controller.signal).toBe("reserved");
+
+    const host = hostThat();
+    const removeFromStore = vi.fn();
+    await controller.commitSignal(remounted, host, removeFromStore);
+
+    expect(removeFromStore).toHaveBeenCalledTimes(1);
+    expect(agent.messages).toHaveLength(1);
+    expect(host.calls).toBe(1);
+    expect(controller.signal).toBe("explained");
+  });
+
+  it("keeps a commit already waiting in the queue across a same-exchange remount, and starts no second one", async () => {
+    const host = hostThat();
+    const removeFromStore = vi.fn();
+
+    agent.holdQueue();
+    const queued = controller.commitSignal(generation, host, removeFromStore);
+    await settle();
+
+    // Same widget remounts while the first commit is still queued, and the
+    // remounted session tries to commit in turn. The report is already
+    // claimed, so the remounted attempt is a no-op and the queued one runs.
+    const remounted = controller.acquire("widget-a");
+    const again = controller.commitSignal(remounted, host, removeFromStore);
+    await settle();
+
+    agent.releaseQueue();
+    await Promise.all([queued, again]);
+    await settle();
+
+    expect(agent.messages).toHaveLength(1);
+    expect(host.calls).toBe(1);
+    expect(removeFromStore).toHaveBeenCalledTimes(1);
+    expect(controller.signal).toBe("explained");
+  });
+
+  it("records explained when the same exchange remounts during the explanation run", async () => {
+    let release: (() => void) | undefined;
+    const slow = hostThat(
+      () =>
+        new Promise<RunAgentResult>((resolve) => {
+          release = () => resolve({ result: undefined, newMessages: [] });
+        }),
+    );
+
+    const commit = controller.commitSignal(generation, slow);
+    for (let attempt = 0; attempt < 50 && !release; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(agent.messages).toHaveLength(1);
+    expect(controller.signal).toBe("message-added");
+
+    // The component unmounts and the same widget mounts again mid-run. The
+    // run belongs to the report, not to the session that started it.
+    const remounted = controller.acquire("widget-a");
+    release?.();
+    await commit;
+    await settle();
+
+    expect(controller.signal).toBe("explained");
+    expect(slow.calls).toBe(1);
+
+    // Nothing left for a host-driven retry from the remounted session to redo.
+    const again = hostThat();
+    await controller.retryExplanation(remounted, again);
+    expect(again.calls).toBe(0);
+    expect(agent.messages).toHaveLength(1);
   });
 
   it("abandons a reservation even when the thread has moved on", () => {
@@ -436,8 +592,8 @@ describe("widget controller signalling", () => {
 
   it("ignores an abandon quoting a stale generation", () => {
     const stale = generation;
-    controller.rebind();
-    const next = controller.rebind();
+    controller.acquire("widget-b");
+    const next = controller.acquire("widget-c");
     controller.observe(next, activity(invalidContent, "settled"));
     expect(controller.signal).toBe("reserved");
 
@@ -473,7 +629,7 @@ describe("widget controller retention", () => {
         threadId: "thread-1",
         activityKey: `filler-${index}`,
       });
-      make(controller, controller.rebind());
+      make(controller, controller.acquire("widget-a"));
     }
   }
 
@@ -490,7 +646,7 @@ describe("widget controller retention", () => {
       threadId: "thread-1",
       activityKey: "act-new",
     });
-    const generation = fresh.rebind();
+    const generation = fresh.acquire("widget-a");
 
     // Previously the new entry was its own eviction candidate, so it vanished
     // on creation and its widget could never leave waiting.
@@ -509,7 +665,7 @@ describe("widget controller retention", () => {
       threadId: "thread-1",
       activityKey: "act-mounted",
     });
-    const mountedGeneration = mounted.rebind();
+    const mountedGeneration = mounted.acquire("widget-a");
     mounted.observe(mountedGeneration, activity(validContent, "pending"));
     expect(mounted.phase).toBe("active");
 
@@ -535,7 +691,7 @@ describe("widget controller retention", () => {
       threadId: "thread-1",
       activityKey: "act-removed",
     });
-    const removedGeneration = removed.rebind();
+    const removedGeneration = removed.acquire("widget-a");
     removed.observe(removedGeneration, activity(invalidContent, "untracked"));
     expect(removed.phase).toBe("removed");
 
@@ -568,8 +724,8 @@ describe("widget controller identity scoping", () => {
       threadId: "thread-1",
       activityKey: "act-2",
     });
-    const firstGen = first.rebind();
-    const secondGen = second.rebind();
+    const firstGen = first.acquire("widget-a");
+    const secondGen = second.acquire("widget-a");
 
     first.observe(firstGen, activity(invalidContent, "settled"));
 
@@ -592,8 +748,8 @@ describe("widget controller identity scoping", () => {
       threadId: "thread-2",
       activityKey: "act-1",
     });
-    const genOne = inThreadOne.rebind();
-    const genTwo = inThreadTwo.rebind();
+    const genOne = inThreadOne.acquire("widget-a");
+    const genTwo = inThreadTwo.acquire("widget-a");
 
     inThreadOne.observe(genOne, activity(invalidContent, "settled"));
 

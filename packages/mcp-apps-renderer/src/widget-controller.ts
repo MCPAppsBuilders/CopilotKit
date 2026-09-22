@@ -70,11 +70,16 @@ export interface McpControllerHost {
 export interface McpWidgetController {
   readonly phase: McpWidgetPhase;
   /**
-   * Start a new exchange for this activity (new resource or server identity).
-   * Releases a reservation the outgoing generation never committed, so it is
-   * not left to rot, and returns the generation every later call must quote.
+   * Take this activity over for a session bound to `exchangeKey`, the widget's
+   * resource/server identity. Returns the generation every later call quotes.
+   *
+   * The same key as the entry already holds is a REMOUNT of the same exchange:
+   * its state is kept wholesale, so a removed widget stays removed and a report
+   * still owed stays owed. A different key is a NEW exchange, whose report
+   * cycle starts over. Either way the generation advances, so whatever the
+   * previous session still had in flight is superseded at its next checkpoint.
    */
-  rebind(): number;
+  acquire(exchangeKey: string): number;
   /** Apply an observation. Stale generations and a `removed` phase are no-ops. */
   observe(generation: number, observation: McpObservation): McpWidgetPhase;
   /**
@@ -101,11 +106,25 @@ export interface McpWidgetController {
   abandonSignal(generation: number): void;
   /** Current signal state, for tests and for a host driving an explicit retry. */
   readonly signal: McpSignalState | undefined;
+  /** Why this widget was retired, once it has been. */
+  readonly reason: McpFailureReason | undefined;
 }
 
 interface Entry {
   generation: number;
+  /**
+   * The resource/server identity of the exchange this entry records, so a
+   * later `acquire` can tell a remount of the same widget from a new one.
+   */
+  exchangeKey?: string;
   phase: McpWidgetPhase;
+  /**
+   * The generation whose proxy response moved this entry to `retiring`. That
+   * response is still on its way out, and its own path must be the one to
+   * conclude the retirement - even if a same-exchange remount has advanced
+   * the generation in the meantime.
+   */
+  retiringGeneration?: number;
   signal?: McpSignalState;
   /** Kept so a retry reuses the message instead of adding a second one. */
   messageId?: string;
@@ -183,19 +202,26 @@ function evictForgettable(
   }
 }
 
-/** Only a live failure the model has not already seen is worth explaining. */
+/**
+ * Whether this failure owes the user an explanation.
+ *
+ * Every terminal failure does, on either path. An earlier version exempted a
+ * tool error on the initial activity, on the grounds that the model had seen it
+ * in its own run and would mention it. Driving the real demo in a browser
+ * disproved that: the model saw the error and said nothing, so the user was
+ * left with a widget vanishing and no explanation at all, which is precisely
+ * what this feature exists to prevent. A possibly redundant sentence is a much
+ * smaller cost than a silent failure.
+ *
+ * What still never reports: anything not established as a live, settled
+ * exchange. History (`untracked`) must never start a run, and `pending` or
+ * `unknown` are not terminal yet.
+ */
 function shouldReserve(
   observation: McpObservation,
   verdict: McpContentVerdict,
 ): boolean {
-  if (verdict.kind !== "retire") return false;
-  if (observation.exchange !== "settled") return false;
-  // An initial tool error is already in the agent's own run: the model saw the
-  // failure, so saying it again would buy a redundant turn. A proxy call never
-  // reaches the model, so its failure always needs reporting.
-  return !(
-    observation.origin === "activity" && verdict.reason.kind === "tool-error"
-  );
+  return verdict.kind === "retire" && observation.exchange === "settled";
 }
 
 export function getWidgetController(
@@ -225,6 +251,21 @@ export function getWidgetController(
     return entry.generation === generation ? entry : undefined;
   };
 
+  /**
+   * A generation allowed to conclude a retirement, or the report it reserved:
+   * the current one, or the one whose proxy response is still pending. A
+   * same-exchange remount advances the generation while that response is in
+   * flight; the response's own path must still be able to finish what it
+   * started, or the exchange would stay `retiring` for good.
+   */
+  const concluding = (generation: number): Entry | undefined => {
+    const entry = current();
+    return entry.generation === generation ||
+      entry.retiringGeneration === generation
+      ? entry
+      : undefined;
+  };
+
   const releaseReservation = (entry: Entry): void => {
     if (entry.signal !== "reserved") return;
     entry.signal = undefined;
@@ -243,26 +284,46 @@ export function getWidgetController(
       return current().signal;
     },
 
-    rebind() {
+    get reason() {
+      return current().reason;
+    },
+
+    acquire(exchangeKey) {
       const entry = current();
-      // A rebind means a genuinely different exchange for this activity (a new
-      // resource or server identity), so its report cycle starts over: a
-      // failure of the new exchange deserves its own explanation, and a
-      // reservation the outgoing one never committed can no longer be
-      // committed by anyone. Anything still in flight for the outgoing
-      // generation finds itself superseded at its next checkpoint, via the
-      // generation bump below.
-      //
-      // Note this is NOT what happens on a remount: the same identity keeps
-      // its generation, and with it the terminal marker that stops a removed
-      // widget from coming back.
+      entry.lastTouched = Date.now();
+      // The generation advances on every acquire, remount or not: the session
+      // that quoted the old one is being torn down, and anything it still has
+      // in flight must find itself superseded at its next checkpoint rather
+      // than act on behalf of the session replacing it.
+      entry.generation += 1;
+
+      if (entry.exchangeKey === exchangeKey) {
+        // Same widget mounting again. Its history is the whole point of keeping
+        // the entry: a removed widget must not come back because the adapter
+        // re-rendered it, and a reservation must not be lost because the
+        // component that made it unmounted before committing.
+        //
+        // Work already in flight for this exchange is left alone too. Owning
+        // the session (the generation) is not owning the report (the claim) or
+        // a pending proxy retirement: an explanation run that has started
+        // must still get to record its outcome, and a response still on its
+        // way out must still get to conclude its retirement.
+        return entry.generation;
+      }
+
+      // A genuinely different exchange for this activity (a new resource or
+      // server identity). Its report cycle starts over: a failure of the new
+      // exchange deserves its own explanation, and a reservation the outgoing
+      // one never committed can no longer be committed by anyone. Dropping the
+      // claim and the pending retirement is what supersedes the old work: it
+      // re-checks them at every checkpoint and bails out.
+      entry.exchangeKey = exchangeKey;
       entry.claim = undefined;
+      entry.retiringGeneration = undefined;
       entry.signal = undefined;
       entry.messageId = undefined;
       entry.reason = undefined;
-      entry.generation += 1;
       entry.phase = "waiting";
-      entry.lastTouched = Date.now();
       return entry.generation;
     },
 
@@ -301,29 +362,35 @@ export function getWidgetController(
         return entry.phase;
       }
 
+      // Recorded on every retirement, reservation or not: the adapter is told
+      // why the widget went even when nothing will be explained.
+      entry.reason = verdict.reason;
       if (shouldReserve(observation, verdict)) {
         entry.signal = "reserved";
-        entry.reason = verdict.reason;
       }
 
       entry.phase = "retiring";
       // Nothing is owed to a widget on the activity path, so it goes now. The
-      // proxy path still owes a response, so its caller finalizes after that.
+      // proxy path still owes a response, so its caller finalizes after that,
+      // and is recorded as the one allowed to.
       if (observation.origin === "activity") {
         entry.phase = "removed";
+      } else {
+        entry.retiringGeneration = generation;
       }
       return entry.phase;
     },
 
     finalizeRemoval(generation) {
-      const entry = owned(generation);
+      const entry = concluding(generation);
       if (!entry || entry.phase !== "retiring") return;
       entry.phase = "removed";
+      entry.retiringGeneration = undefined;
       entry.lastTouched = Date.now();
     },
 
     async commitSignal(generation, host, removeFromStore) {
-      const entry = owned(generation);
+      const entry = concluding(generation);
       // `claim` is what makes two concurrent callers safe: both can read
       // "reserved", but only one can take the claim, and it is taken
       // synchronously here, before any await.
@@ -343,10 +410,13 @@ export function getWidgetController(
 
       const claim = {};
       entry.claim = claim;
+      // Ownership of the report, once taken, is the claim alone - not the
+      // generation. A same-exchange remount advances the generation while the
+      // explanation run is in flight, and that run must still record its
+      // outcome; a new exchange or an abandon drops the claim, which is what
+      // supersedes it.
       const stillOurs = () =>
-        entries.get(key) === entry &&
-        entry.generation === generation &&
-        entry.claim === claim;
+        entries.get(key) === entry && entry.claim === claim;
 
       const agent = identity.agent;
       const messageId = randomUUID();
@@ -357,10 +427,12 @@ export function getWidgetController(
         await mcpAppsRequestQueue.enqueue(
           agent,
           async () => {
-            // Re-checked at execution: the queue waits for an idle agent, so a
-            // rebind or abandon may have superseded this work while it waited,
-            // and the thread may have moved on.
-            if (!stillOurs()) return noRun;
+            // Re-checked at execution: the queue waits for an idle agent, so an
+            // acquire or abandon may have superseded this work while it waited,
+            // and the thread may have moved on. The signal is re-read too: a
+            // superseded commit that had already got past its own checkpoint
+            // may have added the message while this one was queued behind it.
+            if (!stillOurs() || entry.signal !== "reserved") return noRun;
             if (!threadMatches()) {
               releaseReservation(entry);
               return noRun;
@@ -406,10 +478,9 @@ export function getWidgetController(
 
       const claim = {};
       entry.claim = claim;
+      // Claim-owned once started, for the same reason as commitSignal.
       const stillOurs = () =>
-        entries.get(key) === entry &&
-        entry.generation === generation &&
-        entry.claim === claim;
+        entries.get(key) === entry && entry.claim === claim;
 
       const noRun: RunAgentResult = { result: undefined, newMessages: [] };
 
@@ -430,7 +501,7 @@ export function getWidgetController(
     },
 
     abandonSignal(generation) {
-      const entry = owned(generation);
+      const entry = concluding(generation);
       if (!entry) return;
       // Dropping the claim too, so an operation already in flight finds itself
       // superseded at its next checkpoint instead of completing regardless.
